@@ -10,9 +10,13 @@ bash tests/smoke.sh        # full end-to-end run against tests/mocks/{codex,clau
 bash -n scripts/pair.sh    # quick syntax check (smoke.sh does this too)
 ```
 
-This box only has `claude` — never try to run real `codex`/`qwen` here; the
-mocks are the verification story. `./install.sh` is for target machines, not
-this one.
+This box (IS4T-X6-G) has all three default CLIs — `claude`, `codex`, and
+`qwen` (`~/.local/bin/qwen`, backed by a local vLLM endpoint). Still, the
+mocks are the verification story: real-CLI calls burn quota (codex/claude)
+and are never needed to validate the kit. The live deployment on this machine
+is `/data/keshav/scripts/pair.sh` + `/data/keshav/scripts/pair-adapters/`
+with the default lineup (codex architect, claude implementer, qwen junior)
+and `PAIR_HUMAN=Keshav`; keep it in sync when the engine or adapters change.
 
 ## What this does
 

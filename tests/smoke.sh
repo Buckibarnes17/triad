@@ -26,6 +26,18 @@ for f in "$KIT"/adapters/*.sh "$KIT/install.sh" "$KIT"/tests/mocks/* "$0"; do
 done
 pass "bash -n on pair.sh, adapters, install.sh, mocks"
 
+echo "== 1b. adapter contract lint (docs/ADAPTERS.md)"
+for f in "$KIT"/adapters/*.sh; do
+  n=$(basename "$f" .sh)
+  [[ "$n" =~ ^[a-z][a-z0-9_]*$ ]] || fail "adapter name '$n' violates ^[a-z][a-z0-9_]*\$"
+  ( set -euo pipefail; . "$f"
+    v="${n}_display"; [ -n "${!v:-}" ] || { echo "no ${n}_display" >&2; exit 1; }
+    declare -F "${n}_consult" >/dev/null || declare -F "${n}_implement" >/dev/null \
+      || { echo "no ${n}_consult/_implement" >&2; exit 1; }
+  ) || fail "adapter contract: $f"
+done
+pass "every adapter sources cleanly and defines display + a role capability"
+
 echo "== 2. init (default roles) + hostile brief"
 A="$WORK/projA"; mkdir -p "$A"; cd "$A"
 bash "$PAIR_SH" init 'brief with $(dangerous) and `backticks` and "quotes"' >/dev/null
