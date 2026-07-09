@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mock claude CLI for pair-kit smoke tests — emits the single-JSON headless
+# mock claude CLI for Triad smoke tests — emits the single-JSON headless
 # envelope. Logs every arg (one ARG: line each) + the prompt to $MOCK_LOG so
 # tests can assert arg ordering and prompt integrity. Fresh calls mint
 # mock-claude-<n> ids via a counter in $MOCK_COUNTERS; resume echoes the id back.

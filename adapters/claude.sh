@@ -41,12 +41,12 @@ claude_install() { # KIT_DIR PAIR_SH — uses install.sh helpers (ok/render)
   mkdir -p "$skills" "$(dirname "$md")"
   render "$kit/agents/claude/skills/pair-protocol.md" > "$skills/pair-protocol.md"
   ok "installed skill: $skills/pair-protocol.md"
-  if grep -q "Pair protocol" "$md" 2>/dev/null; then
-    ok "CLAUDE.md already mentions the pair protocol (skipped)"
+  if grep -q "Triad Protocol" "$md" 2>/dev/null; then
+    ok "CLAUDE.md already mentions the Triad protocol (skipped)"
   else
     { [ -f "$md" ] && echo; render "$kit/agents/claude/CLAUDE-pair-section.md" \
         | sed "s|the \`pair-protocol\` skill|\`$skills/pair-protocol.md\`|"; } >> "$md"
-    ok "appended pair section to $md"
+    ok "appended Triad section to $md"
   fi
   return 0
 }

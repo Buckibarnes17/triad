@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# pair.sh — communication channel between a fixed set of ROLES, each filled by
-# a pluggable assistant CLI (adapters/<agent>.sh):
+# pair.sh — Triad Protocol engine: communication between a fixed set of ROLES,
+# each filled by a pluggable assistant CLI (adapters/<agent>.sh):
 #   architect   — intake, rulings, reviews; read-only, never edits files
 #   implementer — writes all non-trivial code
 #   junior      — optional lane for very basic tasks, human-gated
@@ -141,6 +141,29 @@ next_seq() { # next_seq <dir> -> zero-padded next file number
   local n
   n=$(ls "$1" 2>/dev/null | grep -c '^[0-9]' || true)
   printf '%03d' "$((n + 1))"
+}
+
+untracked_diff_context() {
+  local f tmp rc
+  while IFS= read -r -d '' f; do
+    printf '\n--- untracked: %s ---\n' "$f"
+    if [ -f "$f" ]; then
+      tmp=$(mktemp)
+      if git diff --no-index -- /dev/null "$f" > "$tmp" 2>/dev/null; then
+        cat "$tmp"
+      else
+        rc=$?
+        if [ "$rc" -eq 1 ]; then
+          cat "$tmp"
+        else
+          printf '(could not render diff for %s; git diff --no-index exited %s)\n' "$f" "$rc"
+        fi
+      fi
+      rm -f "$tmp"
+    else
+      printf '(not a regular file)\n'
+    fi
+  done < <(git ls-files -z --others --exclude-standard)
 }
 
 warn_role_env() { # warn_role_env <envvar> <state value>
@@ -323,6 +346,8 @@ $NOTES"
 $(git status --short)
 === untracked files ===
 $(git ls-files --others --exclude-standard)
+=== untracked file contents ===
+$(untracked_diff_context)
 === git diff HEAD ===
 $DIFF"
     TMP=$(mktemp)
@@ -342,7 +367,7 @@ implement)
   TASK="${1:-}"; [ -n "$TASK" ] || die 'usage: pair.sh implement "<task>"'
   SID=$(session_get implementer)
   OUT=$(mktemp)
-  PROMPT="You are the IMPLEMENTER ($IMPL_NAME) in a pair protocol with $ARCH_NAME (architect).
+  PROMPT="You are the IMPLEMENTER ($IMPL_NAME) in a Triad protocol with $ARCH_NAME (architect).
 Context lives in .pair/ (requirements.md, plan.md, log.md — read them first).
 Implement the task below. Write code + run whatever verifies it. When done,
 summarize what changed and what you verified. If you add anything to the
@@ -391,7 +416,7 @@ approved: $APPROVED_TASK
 given:    $TASK"
   SID=$(session_get junior)
   OUT=$(mktemp)
-  PROMPT="You are the JUNIOR IMPLEMENTER ($JR_NAME) in a three-agent pair protocol
+  PROMPT="You are the JUNIOR IMPLEMENTER ($JR_NAME) in a three-agent Triad protocol
 ($ARCH_NAME = architect/reviewer, $IMPL_NAME = primary implementer, you = junior).
 Shared context lives in .pair/ (requirements.md, plan.md, log.md — read them
 first). You handle ONLY the single very basic task below. Hard limits:

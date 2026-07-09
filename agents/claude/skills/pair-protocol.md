@@ -1,4 +1,4 @@
-# Skill: Pair protocol — you implement, the architect orchestrates and reviews, a junior assists
+# Skill: Triad Protocol — you implement, the architect orchestrates and reviews, a junior assists
 
 **When to use:** The user gives a project/feature brief and hasn't said "solo" — the default for project-scale work is to run it as a pair with an architect agent (Codex by default) via `__PAIR_SH__`.
 

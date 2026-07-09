@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — set up the pair protocol (pluggable assistant adapters) on this machine.
+# install.sh — set up the Triad protocol (pluggable assistant adapters) on this machine.
 #
 # Usage:
 #   ./install.sh [--scripts-dir DIR] [--agents "a b c"]

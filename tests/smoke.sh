@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# smoke.sh — end-to-end test of pair.sh + adapters against the mock agent CLIs
+# smoke.sh — end-to-end test of Triad + adapters against the mock agent CLIs
 # in tests/mocks/ (no real codex/claude/qwen needed). Run: bash tests/smoke.sh
 set -euo pipefail
 
@@ -88,6 +88,8 @@ echo "newfile" > f.txt
 bash "$PAIR_SH" review >/dev/null
 grep -q 'mock-claude-result' .pair/reviews/001.md || fail "fallback review content"
 grep -q 'git diff HEAD' "$MOCK_LOG" || fail "fallback review must embed the diff"
+grep -q 'untracked file contents' "$MOCK_LOG" || fail "fallback review must include untracked file content section"
+grep -qF '+newfile' "$MOCK_LOG" || fail "fallback review must include untracked file contents"
 pass "fallback review via architect consult"
 
 echo "== 8. legacy state.json migration"

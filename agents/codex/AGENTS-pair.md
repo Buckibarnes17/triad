@@ -1,4 +1,4 @@
-# Pair protocol (you are the architect)
+# Triad Protocol (you are the architect)
 
 The user delegates work between role-holding assistants; the lineup lives in
 `.pair/state.json` (defaults: architect=you/Codex, implementer=Claude Code,

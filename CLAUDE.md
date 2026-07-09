@@ -1,4 +1,4 @@
-# pair-kit
+# Triad Protocol
 
 ## Environment & commands
 
@@ -16,7 +16,7 @@ this one.
 
 ## What this does
 
-Role-based multi-CLI pair-programming protocol. Three fixed roles — architect
+Role-based multi-CLI agent communication protocol. Three fixed roles — architect
 (intake/rulings/reviews, read-only), implementer (writes all code), junior
 (optional, human-gated one-approval-one-run lane) — each filled by any agent
 that has an adapter. Defaults: codex/claude/qwen. Shared state per project in
@@ -63,8 +63,8 @@ Gotchas:
   `-c 'sandbox_mode="read-only"'`); `codex review` has no `-C` and
   `--uncommitted` conflicts with a custom prompt.
 - Architects without a native `_review` get the generic fallback: consult the
-  persistent session with `git status`/untracked/`git diff HEAD` embedded in
-  the prompt (guarded for repos with no commits yet).
+  persistent session with `git status`, rendered untracked-file diffs, and
+  `git diff HEAD` embedded in the prompt (guarded for repos with no commits yet).
 - The junior approval gate (exact task match, consume-before-launch) is role
   logic in pair.sh, NOT in the qwen adapter — don't move it into an adapter.
 - Adapter files must be side-effect-free at source time; empty-array

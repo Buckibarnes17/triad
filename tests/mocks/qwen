@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mock qwen CLI for pair-kit smoke tests — emits the JSON EVENT ARRAY shape
+# mock qwen CLI for Triad smoke tests — emits the JSON EVENT ARRAY shape
 # (result carried by the last type=="result" event). Logs argv + prompt to
 # $MOCK_LOG; fresh calls mint mock-qwen-<n> ids via $MOCK_COUNTERS.
 set -euo pipefail

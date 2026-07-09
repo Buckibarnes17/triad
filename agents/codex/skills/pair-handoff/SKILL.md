@@ -1,13 +1,13 @@
 ---
 name: pair-handoff
-description: The role-based pair protocol (architect <-> implementer <-> junior). Use when the user gives a project/feature brief (you become architect/orchestrator and delegate implementation), when a .pair/ directory exists in the working repo, or when an incoming prompt identifies itself as coming from "the implementer" — that means the implementer is driving and you are being consulted headlessly.
+description: The role-based Triad protocol (architect <-> implementer <-> junior). Use when the user gives a project/feature brief (you become architect/orchestrator and delegate implementation), when a .pair/ directory exists in the working repo, or when an incoming prompt identifies itself as coming from "the implementer" — that means the implementer is driving and you are being consulted headlessly.
 metadata:
-  short-description: Pair protocol (roles, .pair/ layout, handoff recognition)
+  short-description: Triad Protocol (roles, .pair/ layout, handoff recognition)
 ---
 
-# Pair handoff (you are the architect)
+# Triad handoff (you are the architect)
 
-Project work runs as a role-based pair; the agent lineup lives in
+Project work runs through the role-based Triad protocol; the agent lineup lives in
 `.pair/state.json` (`.roles` — defaults: architect=you/Codex,
 implementer=Claude Code, junior=Qwen Code). Division of labor is strict:
 

@@ -59,11 +59,11 @@ codex_install() { # KIT_DIR PAIR_SH — uses install.sh helpers (ok/warn/confirm
 
   mkdir -p "$codex_home/skills/pair-handoff" "$codex_home/rules"
 
-  if grep -q "Pair protocol" "$codex_home/AGENTS.md" 2>/dev/null; then
-    ok "AGENTS.md already has the pair section (skipped)"
+  if grep -q "Triad Protocol" "$codex_home/AGENTS.md" 2>/dev/null; then
+    ok "AGENTS.md already has the Triad section (skipped)"
   else
     { [ -f "$codex_home/AGENTS.md" ] && echo; render "$kit/agents/codex/AGENTS-pair.md"; } >> "$codex_home/AGENTS.md"
-    ok "appended pair section to $codex_home/AGENTS.md"
+    ok "appended Triad section to $codex_home/AGENTS.md"
   fi
 
   render "$kit/agents/codex/skills/pair-handoff/SKILL.md" > "$codex_home/skills/pair-handoff/SKILL.md"

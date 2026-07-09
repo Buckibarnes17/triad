@@ -1,8 +1,9 @@
-# pair-kit — a role-based pair-programming protocol for assistant CLIs
+# Triad Protocol — model-agnostic agent communication for assistant CLIs
 
-A portable, battle-tested setup where coding assistants collaborate on a
-project automatically. The protocol has three fixed **roles**; any assistant
-with an adapter (`adapters/<name>.sh`) can fill any role:
+Triad is a portable, battle-tested protocol where coding assistants collaborate
+through explicit roles instead of hardcoded model names. It has three fixed
+**roles**; any assistant with an adapter (`adapters/<name>.sh`) can fill any
+role:
 
 - **Architect / orchestrator / reviewer** (default: **Codex**). Understands
   requirements, writes the task plan, hunts bugs, reviews every diff. Runs
@@ -88,7 +89,7 @@ consumed. The approval is consumed at launch (one approval = one attempted
 run) — a failed run does not make it reusable, and there is no standing
 approval.
 
-## Contents of this kit
+## Contents
 
 | Path | What it is | Installs to |
 |---|---|---|
@@ -121,11 +122,18 @@ approval.
 ```bash
 ./install.sh                        # interactive, shows every change before making it
 ./install.sh --scripts-dir ~/bin    # choose where pair.sh + adapters live
-./install.sh --agents "codex claude"   # only these agents (skip the junior lane)
+./install.sh --agents "codex claude"   # install/check only these adapters
 ```
 
 The installer never edits kernel settings itself — it detects the problem and
 prints the exact sudo commands for you to run.
+
+`--agents` controls installer checks and per-agent setup only. Runtime roles are
+chosen at `pair.sh init`; disable the junior lane with:
+
+```bash
+PAIR_JUNIOR= bash <scripts-dir>/pair.sh init "<brief>"
+```
 
 ## Verify (60 seconds)
 
@@ -144,7 +152,7 @@ protocol against mock CLIs — no real agents, no quota).
 ## Usage
 
 - **Start from the implementer** (e.g. Claude Code): give it a project brief
-  in a repo. Its CLAUDE.md section triggers the protocol: `pair.sh init` →
+  in a repo. Its CLAUDE.md section triggers Triad: `pair.sh init` →
   implement → `pair.sh review` gates → your final sign-off.
 - **Start from the architect** (e.g. Codex): give it the brief. Its AGENTS.md
   tells it to bootstrap `.pair/`, delegate tasks via
@@ -191,7 +199,7 @@ symbols prefixed with the name). It is sourced by both `pair.sh` and
 | `<name>_check` | always | CLI present/usable; print version info; nonzero if not |
 | `<name>_consult OUTFILE SESSION_ID PROMPT` | architect role | Read-only call. Empty `SESSION_ID` = fresh, else resume. Write the reply to `OUTFILE`; print ONLY the (possibly new) session id on stdout — all CLI noise goes to files or /dev/null |
 | `<name>_implement OUTFILE SESSION_ID PROMPT` | implementer / junior role | Same convention, write-capable |
-| `<name>_review OUTFILE SESSION_ID PROMPT` | optional | Native review of uncommitted changes (append to OUTFILE, return the CLI's exit code). Without it, `pair.sh review` falls back to `_consult` with the git diff embedded in the prompt |
+| `<name>_review OUTFILE SESSION_ID PROMPT` | optional | Native review of uncommitted changes (append to OUTFILE, return the CLI's exit code). Without it, `pair.sh review` falls back to `_consult` with `git status`, untracked-file contents, and the git diff embedded in the prompt |
 | `<name>_install KIT_DIR PAIR_SH` | optional | Install hook (skills, config appends, sandbox checks); may use install.sh's `say/ok/warn/confirm/render` helpers |
 
 Then: assign it a role (`PAIR_ARCHITECT=gemini bash pair.sh init ...`), and

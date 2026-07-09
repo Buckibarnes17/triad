@@ -64,7 +64,7 @@ network_access = true
 ### 6. Codex escalation rejected as "data exfiltration"
 
 Codex's approvals reviewer sees "pipe repo contents to an external API" and
-refuses without informed consent — it cannot know the pair protocol is
+refuses without informed consent — it cannot know the Triad protocol is
 intended. Fix: pre-approve the command at the policy layer. Append to
 `~/.codex/rules/default.rules` (adjust the path to where pair.sh lives):
 ```

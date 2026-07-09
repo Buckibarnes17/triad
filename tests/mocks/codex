@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mock codex CLI for pair-kit smoke tests — mimics the exec/resume/review
+# mock codex CLI for Triad smoke tests — mimics the exec/resume/review
 # surfaces pair.sh's codex adapter uses. Logs argv + prompts to $MOCK_LOG.
 set -euo pipefail
 LOG="${MOCK_LOG:-/dev/null}"

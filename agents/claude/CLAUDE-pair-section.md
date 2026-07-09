@@ -1,6 +1,6 @@
-# Pair protocol (append this to your project or global CLAUDE.md)
+# Triad Protocol (append this to your project or global CLAUDE.md)
 
-**Pair protocol (default for project-scale briefs):** Work is delegated between
+**Triad Protocol (default for project-scale briefs):** Work is delegated between
 role-holding assistants — an architect (Codex by default), you (Claude) as the
 implementer, and optionally a junior implementer (Qwen by default); the lineup
 lives in `.pair/state.json`. Unless the user says "solo", a new project/feature
