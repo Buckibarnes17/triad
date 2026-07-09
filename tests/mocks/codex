@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# mock codex CLI for pair-kit smoke tests — mimics the exec/resume/review
+# surfaces pair.sh's codex adapter uses. Logs argv + prompts to $MOCK_LOG.
+set -euo pipefail
+LOG="${MOCK_LOG:-/dev/null}"
+echo "--- codex $*" >> "$LOG"
+
+case "${1:-}" in
+  --version) echo "mock-codex 0.0.0"; exit 0 ;;
+  sandbox) exit 0 ;;
+  exec)
+    shift
+    if [ "${1:-}" = resume ]; then
+      shift; rid="$1"; shift
+      out=""
+      while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
+      prompt=$(cat)
+      printf 'PROMPT:%s\n' "$prompt" >> "$LOG"
+      echo "mock codex ruling (resume $rid): ACCEPT — proceed." > "$out"
+      exit 0
+    fi
+    out=""
+    while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
+    prompt=$(cat)
+    printf 'PROMPT:%s\n' "$prompt" >> "$LOG"
+    echo '{"type":"thread.started","thread_id":"mock-codex-1"}'
+    cat > "$out" <<'BODY'
+=== REQUIREMENTS ===
+mock requirements body
+=== PLAN ===
+T1: mock task
+BODY
+    exit 0
+    ;;
+  review)
+    prompt=$(cat)
+    printf 'PROMPT:%s\n' "$prompt" >> "$LOG"
+    echo "mock review of uncommitted changes"
+    echo "VERDICT: APPROVED"
+    exit 0
+    ;;
+esac
+echo "mock codex: unhandled args: $*" >&2
+exit 1
