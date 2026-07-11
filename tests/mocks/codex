@@ -16,7 +16,15 @@ case "${1:-}" in
       while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
       prompt=$(cat)
       printf 'PROMPT:%s\n' "$prompt" >> "$LOG"
-      echo "mock codex ruling (resume $rid): ACCEPT — proceed." > "$out"
+      if [ "${MOCK_CHECKPOINT_JSON:-0}" = 1 ] && [[ "$prompt" == *"CONTEXT"*"CHECKPOINT"* ]]; then
+        echo '{"goals":"preserve context","decisions":[{"decision":"use checkpoint","rationale":"bounded recovery"}],"blockers":"none","approvals_pending":"none","next_actions":["continue task"],"paths":["scripts/pair.sh"],"tests":"smoke passed"}' > "$out"
+      else
+        echo "mock codex ruling (resume $rid): ACCEPT — proceed." > "$out"
+      fi
+      if [ "${MOCK_USAGE:-0}" = 1 ]; then
+        echo '{"type":"item.completed","item":{"type":"command_execution"}}'
+        echo '{"type":"turn.completed","usage":{"input_tokens":900,"cached_input_tokens":700,"output_tokens":100}}'
+      fi
       exit 0
     fi
     out=""
@@ -24,6 +32,10 @@ case "${1:-}" in
     prompt=$(cat)
     printf 'PROMPT:%s\n' "$prompt" >> "$LOG"
     echo '{"type":"thread.started","thread_id":"mock-codex-1"}'
+    if [ "${MOCK_USAGE:-0}" = 1 ]; then
+      echo '{"type":"item.completed","item":{"type":"command_execution"}}'
+      echo '{"type":"turn.completed","usage":{"input_tokens":900,"cached_input_tokens":700,"output_tokens":100}}'
+    fi
     cat > "$out" <<'BODY'
 === REQUIREMENTS ===
 mock requirements body

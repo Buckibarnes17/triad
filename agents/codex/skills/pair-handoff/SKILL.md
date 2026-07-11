@@ -7,6 +7,9 @@ metadata:
 
 # Triad handoff (you are the architect)
 
+Load and follow the companion `context-budget` skill for every Triad task.
+Treat sessions as disposable cache and `.pair/` disk state as durable truth.
+
 Project work runs through the role-based Triad protocol; the agent lineup lives in
 `.pair/state.json` (`.roles` — defaults: architect=you/Codex,
 implementer=Claude Code, junior=Qwen Code). Division of labor is strict:
@@ -49,9 +52,11 @@ Attribution: every agent addition to these shared files starts with
 `### <Agent> — <YYYY-MM-DD HH:MM:SS>` (the agent's display name or the user's
 name).
 
-If `.pair/` exists, READ state.json, requirements.md, plan.md, and the latest
-review/suggestion before doing anything — the collaboration is already running
-and your persistent session may have been resumed mid-flow.
+If `.pair/` exists, READ state.json, requirements.md, plan.md, the latest
+review/suggestion, and the current role checkpoint before doing anything. Read
+only the configured tail of `log.md` (default 40 lines), never the full log
+automatically. The collaboration may have resumed in a fresh session; when a
+checkpoint digest disagrees with current git, trust disk.
 
 ## Recognizing which direction is active
 

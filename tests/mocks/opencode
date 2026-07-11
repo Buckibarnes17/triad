@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# mock opencode CLI for Triad smoke tests — emits the JSONL event shape
+# (one JSON object per line; .sessionID on every event; reply text split
+# across MULTIPLE type=="text" events to prove ordered concatenation).
+# Logs argv + prompt to $MOCK_LOG; fresh calls mint mock-opencode-<n> ids.
+set -euo pipefail
+LOG="${MOCK_LOG:-/dev/null}"
+CDIR="${MOCK_COUNTERS:-${TMPDIR:-/tmp}}"
+{ echo "--- opencode"; printf 'ARG:%s\n' "$@"; } >> "$LOG"
+[ "${1:-}" = --version ] && { echo "1.17.8-mock"; exit 0; }
+
+# argv shape: run "<msg>" --format json [--agent plan|--dangerously-skip-permissions] [-s id] [-m model]
+resume=""
+[ "${1:-}" = run ] && { printf 'PROMPT:%s\n' "${2:-}" >> "$LOG"; shift 2 || true; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -s) resume="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -n "$resume" ]; then
+  sid="$resume"
+else
+  n=$(cat "$CDIR/opencode.n" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$CDIR/opencode.n"
+  sid="mock-opencode-$n"
+fi
+jq -cn --arg sid "$sid" '{type:"step_start", sessionID:$sid, part:{type:"step-start"}}'
+jq -cn --arg sid "$sid" '{type:"text", sessionID:$sid, part:{type:"text", text:("mock-opencode-result ")}}'
+jq -cn --arg sid "$sid" '{type:"text", sessionID:$sid, part:{type:"text", text:$sid}}'
+if [ "${MOCK_USAGE:-0}" = 1 ]; then
+  jq -cn --arg sid "$sid" '{type:"tool_use", sessionID:$sid, part:{type:"tool"}}'
+  jq -cn --arg sid "$sid" '{type:"step_finish", sessionID:$sid, part:{type:"step-finish", reason:"stop",
+    tokens:{input:500, output:60, reasoning:40, cache:{read:300, write:0}}}}'
+else
+  jq -cn --arg sid "$sid" '{type:"step_finish", sessionID:$sid, part:{type:"step-finish", reason:"stop"}}'
+fi

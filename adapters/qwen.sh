@@ -26,6 +26,23 @@ qwen_implement() { # OUTFILE SESSION_ID PROMPT -> stdout: session id only
   # output is a JSON event array; the final type=="result" event carries the reply
   jq -r '[.[] | select(.type=="result")] | last | .result // empty' "$raw" > "$out"
   new_sid=$(jq -r '[.[] | select(.type=="result")] | last | .session_id // empty' "$raw")
+  if [ -n "${PAIR_USAGE_FILE:-}" ]; then
+    jq '
+      ([.[] | select(.type == "result")] | last // {}) as $r
+      | ($r.usage // $r.stats.usage // null) as $u
+      | if ($u | type) != "object" then empty else
+          {
+            last_input_tokens: ($u.input_tokens // $u.inputTokens // 0),
+            call_total_tokens: (($u.input_tokens // $u.inputTokens // 0)
+              + ($u.output_tokens // $u.outputTokens // 0)),
+            cached_input_tokens: ($u.cached_input_tokens // $u.cachedInputTokens // 0),
+            tool_calls: ([.[] | select(.type == "tool_use" or .type == "tool_call")] | length)
+          }
+          + (if ($u.context_window // $u.contextWindow // null) != null
+             then {context_window: ($u.context_window // $u.contextWindow)} else {} end)
+        end
+    ' "$raw" > "$PAIR_USAGE_FILE" 2>/dev/null || :
+  fi
   if [ ! -s "$out" ]; then
     mv "$raw" "$out"
     echo "qwen adapter: could not parse result — raw output kept" >&2

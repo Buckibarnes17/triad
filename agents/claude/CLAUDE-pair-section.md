@@ -12,7 +12,9 @@ explicit approval, recorded per-task via `bash __PAIR_SH__ junior-approve` (one
 approval = one run); if the architect's review finds the junior's work not up
 to the mark, the task goes back to you. Every addition to shared `.pair/`
 files starts with `### <Agent> — <timestamp>`. Full loop in the
-`pair-protocol` skill. Small fixes, questions, and ops tasks stay solo — the
+`pair-protocol` skill; the companion `context-budget` skill is mandatory and
+keeps log reads/output bounded while `pair.sh` checkpoints and rolls sessions
+over before context pressure becomes destructive. Small fixes, questions, and ops tasks stay solo — the
 protocol is for buildable project work.
 
 Governance: the architect's final APPROVED is not the end — the user gives

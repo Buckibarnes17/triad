@@ -20,6 +20,26 @@ claude__call() { # OUTFILE SESSION_ID PROMPT PERMISSION_MODE TOOLS_CSV -> stdout
          --allowedTools "$tools")
   claude "${args[@]}" > "$raw" || { mv "$raw" "$out"; return 1; }
   jq -r '.result // empty' "$raw" > "$out"
+  # Optional engine-owned telemetry sidecar. Claude's result envelope exposes
+  # per-inference `usage.iterations`; the last iteration is resident pressure,
+  # while sums across the array are this dispatch's cumulative spend.
+  if [ -n "${PAIR_USAGE_FILE:-}" ]; then
+    jq '
+      (.usage.iterations // []) as $its
+      | if ($its | length) == 0 then empty else
+          ($its | last) as $last
+          | {
+              last_input_tokens: (($last.input_tokens // 0)
+                + ($last.cache_creation_input_tokens // 0)
+                + ($last.cache_read_input_tokens // 0)),
+              call_total_tokens: ($its | map(
+                  (.input_tokens // 0) + (.cache_creation_input_tokens // 0)
+                  + (.cache_read_input_tokens // 0) + (.output_tokens // 0)) | add),
+              cached_input_tokens: ($its | map(.cache_read_input_tokens // 0) | add)
+            }
+        end
+    ' "$raw" > "$PAIR_USAGE_FILE" 2>/dev/null || :
+  fi
   # headless --resume mints a new session id — track it, or later resumes lose context
   new_sid=$(jq -r '.session_id // empty' "$raw")
   rm -f "$raw"
@@ -41,6 +61,8 @@ claude_install() { # KIT_DIR PAIR_SH — uses install.sh helpers (ok/render)
   mkdir -p "$skills" "$(dirname "$md")"
   render "$kit/agents/claude/skills/pair-protocol.md" > "$skills/pair-protocol.md"
   ok "installed skill: $skills/pair-protocol.md"
+  render "$kit/agents/claude/skills/context-budget.md" > "$skills/context-budget.md"
+  ok "installed skill: $skills/context-budget.md"
   if grep -q "Triad Protocol" "$md" 2>/dev/null; then
     ok "CLAUDE.md already mentions the Triad protocol (skipped)"
   else

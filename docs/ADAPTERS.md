@@ -54,7 +54,8 @@ this (`agent 'x' cannot hold the <role> role`).
   — except `_review`, which appends to a file that already has an attribution
   header).
 - `SESSION_ID` — empty string = start a fresh session; non-empty = resume that
-  session. If the CLI cannot resume, start fresh and say so in a stderr note.
+  session. If a supplied id definitely does not exist, return reserved code 3;
+  the engine performs the checkpointed fresh retry.
 - `PROMPT` — the full prompt, passed as one argument. Pass it to your CLI
   exactly (quote it; never let the shell expand its contents).
 
@@ -69,6 +70,53 @@ corrupts session tracking.
 
 Return nonzero on failure and leave whatever the CLI produced in `OUTFILE`
 (the engine keeps it for diagnosis and dies with a pointer to it).
+
+Exit code `3` is reserved for a precise **session id not found / cannot
+resume** condition. Only return `3` when the prompt definitely did not run;
+the engine will checkpoint the dead session and attempt one fresh
+architect/implementer call. Return any other nonzero code for ordinary CLI,
+model, permission, or task failures. The junior lane is never retried.
+
+### Optional context telemetry sidecar
+
+Before a consult, implement, or native-review dispatch, the engine makes
+`PAIR_USAGE_FILE` available to the adapter as an empty temporary-file path.
+It is deliberately not exported to the assistant CLI child process. An
+adapter may write one JSON object there after parsing the CLI response;
+adapters that ignore it remain fully compatible.
+
+```json
+{
+  "last_input_tokens": 84210,
+  "context_window": 200000,
+  "call_total_tokens": 426000,
+  "cached_input_tokens": 391000,
+  "tool_calls": 17
+}
+```
+
+Every field is optional, numeric, non-negative, and describes the completed
+dispatch. Meanings are deliberately separate:
+
+- `last_input_tokens`: resident input on the final model inference; this is
+  the context-pressure signal, not cumulative spend.
+- `context_window`: active model window for that final inference.
+- `call_total_tokens`: raw tokens consumed by the whole dispatch, including
+  any internal tool iterations.
+- `cached_input_tokens`: cached-input slice of that dispatch.
+- `tool_calls`: tool calls made inside that dispatch.
+
+Do not print telemetry to stdout and do not put prompt/reply text, secrets, or
+credentials in the sidecar. Invalid JSON or invalid fields are ignored and the
+engine falls back to a conservative prompt/reply-size estimate. A partial
+sidecar is valid: for example, reporting only `call_total_tokens` improves
+spend accounting while resident context remains estimated. The engine owns
+policy and rollover decisions; adapters only report measurements.
+
+Shipped telemetry coverage is deliberately best-effort: Claude parses
+`usage.iterations`, Codex parses JSONL `turn.completed`, and Qwen/OpenCode
+write a sidecar only when their result events include recognized usage fields.
+Native review commands without structured usage fall back to estimation.
 
 ### Source-time rules
 
@@ -114,7 +162,20 @@ machine-level change behind `confirm`.
   persists it).
 - `adapters/qwen.sh` — JSON event-*array* output parsing; binary addressed by
   absolute path because it's not on non-login-shell PATH.
+- `adapters/opencode.sh` — JSONL (one event per line — parse with plain `jq`
+  filters, no array indexing) where the reply is split across *multiple*
+  `type=="text"` events that must be concatenated in order (`jq -rj`);
+  session id read from `.sessionID` (present on every event); one CLI in two
+  lanes via different flags (`--agent plan` = read-only consult,
+  `--dangerously-skip-permissions` = write); no native review → generic
+  fallback. Env: `PAIR_OPENCODE_BIN`, `PAIR_OPENCODE_MODEL` (`-m
+  provider/model` passthrough).
 - `adapters/template.sh` — commented skeleton to copy.
+
+The output-shape lesson from the reference set: know whether your CLI emits a
+JSON **array** (qwen — needs `jq '[.[] | select(...)]'`), **JSONL** (codex,
+opencode — plain `jq 'select(...)'` per line), or a **single object** (claude)
+— and whether the reply is one field or split across events.
 
 ## Testing without burning quota
 

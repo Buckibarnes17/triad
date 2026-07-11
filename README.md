@@ -3,8 +3,8 @@
 Triad lets coding assistants collaborate on a project **through explicit
 roles, not hardcoded model names**. Any assistant CLI can be plugged into any
 role by writing one adapter file — and swapped out again without touching the
-engine. It ships with adapters for Codex, Claude Code, and Qwen Code, plus a
-template for adding your own.
+engine. It ships with adapters for Codex, Claude Code, Qwen Code, and
+opencode, plus a template for adding your own.
 
 The three roles (hence the name):
 
@@ -22,6 +22,12 @@ Give a project brief to either the implementer or the architect and the
 collaboration starts by itself: each agent keeps a persistent session
 (resumable by id), and everything they exchange is written to an auditable
 `.pair/` directory in your project root.
+
+Long sessions are managed automatically: Triad tracks resident context
+pressure separately from cumulative token spend, writes durable semantic
+checkpoints, and rolls architect/implementer sessions over before their
+context windows become destructive. Fresh sessions re-ground from `.pair/`;
+the junior lane is never auto-retried or rolled over.
 
 ```
 you ──brief──▶ implementer ──pair.sh init──▶ architect writes requirements.md + plan.md
@@ -50,7 +56,8 @@ Always required: `jq`, `git`, bash ≥ 4.4, Linux (macOS needs coreutils for
 
 Plus the CLI for each agent you enable (only the roles you use):
 
-- `codex` (Codex CLI ≥ 0.13x) — logged in; needs `exec`, `exec resume`,
+- `codex` (Codex CLI with JSONL `exec` + `exec resume`; verified with 0.144.1)
+  — logged in; needs `exec`, `exec resume`,
   `review`. On Linux, unprivileged user namespaces must be enabled for its
   sandbox (the installer detects this and prints the fix —
   see [TROUBLESHOOTING #4](TROUBLESHOOTING.md)).
@@ -59,8 +66,17 @@ Plus the CLI for each agent you enable (only the roles you use):
 - `qwen` (Qwen Code CLI ≥ 0.19.x) — configured (`~/.qwen/settings.json`);
   needs `-p`, `-r`, `-o json`. Not assumed to be on PATH — it is called by
   absolute path (default `~/.local/bin/qwen`, override `PAIR_QWEN_BIN`).
+- `opencode` (opencode CLI, verified with 1.17.8) — providers configured;
+  needs `run`, `--format json`, `-s`, `--agent`. Also called by absolute path
+  (default `~/.opencode/bin/opencode`, override `PAIR_OPENCODE_BIN`); pick a
+  model with `PAIR_OPENCODE_MODEL=provider/model`.
 
 Using a different assistant? See [Swapping agents in and out](#swapping-agents-in-and-out).
+
+Update a global npm installation with `npm install -g @openai/codex@latest`
+(use your system's package-manager/root convention if the global prefix is
+root-owned), then verify with `codex --version`. Keeping the CLI current is
+important for model compatibility and structured usage telemetry.
 
 ### Step 2 — clone and self-test
 
@@ -149,6 +165,7 @@ pair.sh review [notes]                    architect reviews uncommitted changes 
 pair.sh implement "<task>"                drive the implementer headless (architect-side entry)
 pair.sh junior-approve "<task>" "<note>"  record the human's one-time approval for a junior task
 pair.sh junior "<task>"                   delegate the approved basic task to the junior
+pair.sh checkpoint [role]                write a durable checkpoint without rolling over
 pair.sh status                            roles + state + last log entries
 ```
 
@@ -164,6 +181,7 @@ plan.md             # task list T1,T2,... with done-conditions
 reviews/NNN.md      # each review verdict (VERDICT: APPROVED / CHANGES_REQUIRED)
 suggestions/NNN.md  # implementer suggestions + architect rulings
 log.md              # append-only timeline of every exchange
+checkpoints/<role>/  # immutable NNN.md handoffs + current.md for fresh sessions
 ```
 
 `state.json` shape — roles are fixed at `pair.sh init` and live here (edit
@@ -176,6 +194,12 @@ automatically; pre-adapter state files are migrated in place):
   "human":    "you",
   "sessions": {"architect": {"agent": "codex", "id": "019f..."},
                "implementer": {"agent": "claude", "id": "..."}},
+  "context_policy": {"mode": "auto", "soft_tokens": 100000,
+                     "rollover_tokens": 150000, "rollover_pct": 70},
+  "context": {"architect": {"resident_input_tokens": 84210,
+                              "raw_total_tokens": 426000,
+                              "checkpoint_due": false, "rollover_due": false}},
+  "checkpoints": {"architect": []},
   "phase":    "implement",
   "junior_approval": {"task": "...", "note": "...", "approver": "you",
                       "approved_at": "...", "consumed": false}
@@ -226,7 +250,21 @@ the-session-id rule, install hooks, mock-based testing — is in
 **[docs/ADAPTERS.md](docs/ADAPTERS.md)**. Reference implementations:
 `adapters/codex.sh` (native review, JSONL sessions), `adapters/claude.sh`
 (one CLI in two roles with different permission lanes), `adapters/qwen.sh`
-(JSON event-array output, absolute-path binary).
+(JSON event-array output, absolute-path binary), `adapters/opencode.sh`
+(JSONL with multi-event reply concatenation, read-only lane via its `plan`
+agent).
+
+Any shipped adapter can hold any capable role, e.g.:
+
+```bash
+PAIR_ARCHITECT=opencode pair.sh init "<brief>"     # opencode plans & reviews (fallback review)
+PAIR_IMPLEMENTER=opencode pair.sh init "<brief>"   # opencode writes the code
+PAIR_JUNIOR=opencode pair.sh init "<brief>"        # opencode as the human-gated junior
+```
+
+The default lineup remains Codex + Claude Code + Qwen Code; opencode — like
+any additional adapter — is opt-in per project via these variables, never a
+silent default change.
 
 To swap an agent mid-project: edit `.roles` in `.pair/state.json` — the next
 call notes the reassignment and starts that role on a fresh session.
@@ -244,6 +282,39 @@ Role assignment (read once at `pair.sh init`, then persisted in state.json):
 | `PAIR_ADAPTERS_DIR` | `<pair.sh dir>/pair-adapters`, else `../adapters` | Where adapters load from |
 | `PAIR_DRIVER` | per-subcommand | Who is logged as delegating (`implement` → the architect, `junior` → the implementer) |
 
+Context policy is also captured only at `pair.sh init`; persisted state wins
+afterward:
+
+| Variable | Default | Effect |
+|---|---:|---|
+| `PAIR_CTX_MODE` | `auto` | `auto` checkpoints/rolls; `warn` reports only; `off` disables actions |
+| `PAIR_CTX_SOFT_TOKENS` | `100000` | One proactive checkpoint per live session |
+| `PAIR_CTX_ROLLOVER_TOKENS` | `150000` | Resident-token rollover threshold |
+| `PAIR_CTX_ROLLOVER_PCT` | `70` | Rollover percent when the model window is known |
+| `PAIR_CTX_CALL_LIMIT` | `20` | Pair/tool-call rollover fallback |
+| `PAIR_CTX_RAW_WARN_TOKENS` | `2000000` | Cumulative-spend checkpoint warning threshold |
+| `PAIR_CTX_LOG_TAIL` | `40` | Routine `.pair/log.md` tail given to agents |
+| `PAIR_CTX_REVIEW_MAX_BYTES` | `200000` | Combined fallback-review bundle cap |
+| `PAIR_CTX_IMPLEMENT_FACTOR` | `4` | Conservative estimator multiplier for write lanes |
+
+Adapters may report numeric usage through a private temporary sidecar. This
+is optional: unsupported/invalid telemetry falls back to an engine estimate.
+The sidecar path is not exported to the assistant process and must never
+contain prompts, replies, credentials, keys, or environment values.
+
+### Checkpoint and rollover behavior
+
+- At soft pressure, `auto` writes one checkpoint and keeps the session.
+- At rollover pressure, it writes history/current/log/state first, then clears
+  only the old session and per-session pressure counters. Lifetime raw/cached
+  spend remains visible.
+- The fresh call reads the current handoff plus canonical `.pair/` files. A
+  working-tree digest mismatch produces a staleness warning; disk wins.
+- A genuine adapter session-not-found signal gets one fresh retry for the
+  architect/implementer. Arbitrary failures and every junior call get none.
+- `pair.sh checkpoint architect` or `implementer` creates a manual recovery
+  point. `checkpoint junior` is mechanical-only and never invokes the junior.
+
 Adapter-specific (each adapter documents its own):
 
 | Variable | Default | Effect |
@@ -252,6 +323,8 @@ Adapter-specific (each adapter documents its own):
 | `PAIR_CODEX_MODEL` | (codex default) | Codex `-m` passthrough |
 | `PAIR_QWEN_BIN` | `~/.local/bin/qwen` | Absolute path to the qwen CLI |
 | `PAIR_QWEN_APPROVAL` | `yolo` | qwen `--approval-mode` (headless `default` denies edits/shell) |
+| `PAIR_OPENCODE_BIN` | `~/.opencode/bin/opencode` | Absolute path to the opencode CLI |
+| `PAIR_OPENCODE_MODEL` | (opencode default) | opencode `-m provider/model` passthrough |
 
 Example: `PAIR_CLAUDE_MODEL=sonnet PAIR_CLAUDE_EFFORT=medium pair.sh implement "T2: ..."`
 
@@ -278,7 +351,10 @@ Example: `PAIR_CLAUDE_MODEL=sonnet PAIR_CLAUDE_EFFORT=medium pair.sh implement "
 Every `init/ask/suggest/review` call burns the architect's quota; every
 `implement` call burns the implementer's (at opus/high-effort rates by
 default — dial down via the config table). Review per completed task, not per
-file-save. A locally-served junior (the default qwen setup) costs nothing —
+file-save. Cached input still counts as token volume even when priced more
+cheaply, so repeated large contexts can dominate raw usage; bounded log/diff
+views and rollover prevent that resident prefix from growing forever. A
+locally-served junior (the default qwen setup) costs nothing —
 but it is a small model, which is exactly why it only gets junior tasks.
 
 ## Repository layout
@@ -288,7 +364,7 @@ but it is a small model, which is exactly why it only gets junior tasks.
 | `scripts/pair.sh` | The engine (roles, gates, state, attribution) | `<scripts-dir>/pair.sh` |
 | `adapters/<name>.sh` | One adapter per assistant CLI + `template.sh` | `<scripts-dir>/pair-adapters/` |
 | `docs/ADAPTERS.md` | The full adapter contract | — |
-| `agents/<name>/` | Per-agent install assets (skills, instruction snippets) | agent-specific (see adapter) |
+| `agents/<name>/` | Per-agent install assets (`pair-*` + mandatory `context-budget` skills, instruction snippets) | agent-specific (see adapter) |
 | `install.sh` | Setup + prerequisite checks (adapter-driven) | — |
 | `tests/` | Mock CLIs + `smoke.sh` end-to-end suite (no quota) | — |
 | `TROUBLESHOOTING.md` | Every failure hit while building this, with fixes | — |

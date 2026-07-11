@@ -2,6 +2,9 @@
 
 **When to use:** The user gives a project/feature brief and hasn't said "solo" — the default for project-scale work is to run it as a pair with an architect agent (Codex by default) via `__PAIR_SH__`.
 
+**Mandatory companion:** read and follow the installed `context-budget` skill
+for every Triad task. Sessions are disposable; `.pair/` is durable truth.
+
 ## Roles (enforced, not aspirational)
 
 Roles are held by agents named in `.pair/state.json` (`.roles`); the defaults
@@ -20,7 +23,7 @@ Every addition to `.pair/log.md`, `.pair/plan.md`, `.pair/suggestions/NNN.md`, `
 
 ## Steps, in order
 
-1. From the project root, initialize: `bash __PAIR_SH__ init "<the brief, verbatim + relevant context>"`. This git-inits if needed, creates `.pair/`, and has the architect write `requirements.md` + `plan.md` (tasks T1, T2, … with done-conditions). Read both files fully. (A different lineup is chosen here too, e.g. `PAIR_ARCHITECT=claude PAIR_JUNIOR= bash __PAIR_SH__ init ...` — roles then persist in `state.json`.)
+1. From the project root, initialize: `bash __PAIR_SH__ init "<the brief, verbatim + relevant context>"`. This git-inits if needed, creates `.pair/`, and has the architect write `requirements.md` + `plan.md` (tasks T1, T2, … with done-conditions). Read both files fully and only the configured tail of `log.md` (default 40 lines). (A different lineup is chosen here too, e.g. `PAIR_ARCHITECT=claude PAIR_JUNIOR= bash __PAIR_SH__ init ...` — roles then persist in `state.json`.)
 2. If requirements look wrong or underspecified, challenge before coding: `bash __PAIR_SH__ ask "<question>"`. Surface real ambiguities to the user — the architect rules on design, the user rules on scope.
 3. Implement **one task at a time** from `plan.md`, following the project's normal conventions. Verify it yourself first — run the code/tests. Do not present unverified work for review.
    - **Junior lane (optional):** if a task is genuinely trivial (output validation, a minimal mechanical fix), you may *propose* delegating it to the junior — say which task and why the junior suffices, and **wait for the user's explicit yes**. Then `junior-approve` + `junior` as above. Never invoke the junior without a fresh recorded approval; never split a real task into "basic" pieces to route around the gate. The junior's output goes through the same review gate as yours.

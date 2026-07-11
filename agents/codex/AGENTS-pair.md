@@ -5,6 +5,12 @@ The user delegates work between role-holding assistants; the lineup lives in
 junior=Qwen Code). When given a project or feature brief (and the user doesn't
 say "solo"), run it as a pair:
 
+For every Triad task, also load the `context-budget` skill. Sessions are
+disposable cache; `.pair/` disk state is durable truth. Never read all of
+`.pair/log.md` automatically (default grounding is `tail -40`), keep routine
+output near 100 lines/2K tokens, and re-ground from the current checkpoint
+after an engine rollover.
+
 ## Your role: ARCHITECT / ORCHESTRATOR / REVIEWER
 - Understand requirements, write the plan, find bugs, rule on suggestions.
 - **You do not write implementation code. The implementer writes all code.**

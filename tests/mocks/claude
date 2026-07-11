@@ -9,10 +9,10 @@ CDIR="${MOCK_COUNTERS:-${TMPDIR:-/tmp}}"
 { echo "--- claude"; printf 'ARG:%s\n' "$@"; } >> "$LOG"
 [ "${1:-}" = --version ] && { echo "mock-claude 0.0.0"; exit 0; }
 
-resume=""
+resume=""; prompt=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    -p) printf 'PROMPT:%s\n' "$2" >> "$LOG"; shift 2 ;;
+    -p) prompt="$2"; printf 'PROMPT:%s\n' "$2" >> "$LOG"; shift 2 ;;
     --resume) resume="$2"; shift 2 ;;
     *) shift ;;
   esac
@@ -23,4 +23,14 @@ else
   n=$(cat "$CDIR/claude.n" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$CDIR/claude.n"
   sid="mock-claude-$n"
 fi
-jq -n --arg sid "$sid" '{session_id: $sid, result: ("mock-claude-result " + $sid)}'
+result="mock-claude-result $sid"
+if [ "${MOCK_CHECKPOINT_JSON:-0}" = 1 ] && [[ "$prompt" == *"CONTEXT"*"CHECKPOINT"* ]]; then
+  result='{"goals":"preserve context","decisions":[{"decision":"use checkpoint","rationale":"bounded recovery"}],"blockers":"none","approvals_pending":"none","next_actions":["continue task"],"paths":["scripts/pair.sh"],"tests":"smoke passed"}'
+fi
+if [ "${MOCK_USAGE:-0}" = 1 ]; then
+  jq -n --arg sid "$sid" --arg result "$result" '{session_id: $sid, result: $result,
+    usage:{iterations:[{input_tokens:100, cache_creation_input_tokens:20,
+      cache_read_input_tokens:800, output_tokens:80}]}}'
+else
+  jq -n --arg sid "$sid" --arg result "$result" '{session_id: $sid, result: $result}'
+fi

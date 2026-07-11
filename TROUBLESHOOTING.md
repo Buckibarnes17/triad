@@ -18,13 +18,15 @@ refusal, `agent '<x>' cannot hold the <role> role`, means the adapter exists
 but lacks the required function (`_consult` for architect, `_implement` for
 implementer/junior).
 
-### 2. Review looks different: prompt contains the whole git diff
+### 2. Review looks different: prompt contains an embedded git diff
 
 Working as designed. Only agents with a native review command (codex) define
 `<name>_review`; for any other architect, `pair.sh review` falls back to
-resuming the architect session with the review prompt plus the embedded
-`git status` / untracked list / `git diff HEAD`. Note: a very large diff can
-blow the model's context window — review per task, not per milestone.
+resuming the architect session with the review prompt plus an embedded,
+combined `git status` / untracked / binary-diff bundle. The bundle is capped
+by `context_policy.review_max_bytes` and ends with `[TRUNCATED]` plus the
+omitted byte count when necessary. Review per task, not per milestone; the
+agent can inspect current disk for omitted detail.
 
 ### 3. Roles seem to ignore `PAIR_ARCHITECT` etc.
 
@@ -91,6 +93,22 @@ No `-s`/`-C` flags (unlike plain `exec`). Sandbox is set via
 `codex exec --json` emits JSONL; the id is the first
 `{"type":"thread.started","thread_id":"..."}` event (the adapter extracts it).
 `--ephemeral` runs are NOT resumable — don't add it to the adapter.
+
+### 9a. Checkpoint falls back because the configured model needs a newer Codex
+
+The mechanical/synthesized checkpoint remains safe, but the semantic call may
+report that the configured model requires a newer app or CLI. Update the same
+installation channel you already use; for the global npm package:
+
+```bash
+npm install -g @openai/codex@latest
+codex --version
+```
+
+If the npm global prefix is root-owned, use the machine's normal privileged
+package-install procedure. After upgrading, rerun `pair.sh checkpoint
+architect`; a healthy call ends with `semantic_valid=true`. Triad was live
+validated with Codex CLI 0.144.1 and a resumed architect checkpoint.
 
 ## Claude adapter
 
@@ -172,12 +190,82 @@ jq '.modelProviders' ~/.qwen/settings.json      # expect matching baseUrl
 No API cost, but it is a small model — which is exactly why the protocol
 restricts it to junior tasks.
 
+## OpenCode adapter
+
+### 18. "opencode adapter: binary not found/executable"
+
+The opencode CLI installs to `~/.opencode/bin/opencode`, which is on PATH
+only for login shells — the adapter therefore calls it by absolute path.
+If yours lives elsewhere, set `PAIR_OPENCODE_BIN=/path/to/opencode`. Verify:
+`$PAIR_OPENCODE_BIN --version` (adapter verified against 1.17.8).
+
+### 19. OpenCode JSON parsing / sessions / reply text
+
+`opencode run "<msg>" --format json` emits **JSONL** (one event per line, not
+an array — codex-style, unlike qwen). Every event carries `.sessionID`; the
+reply text is split across *multiple* `.type=="text"` events at `.part.text`,
+which the adapter concatenates in order (`jq -rj`). If the adapter reports
+"could not parse any text event", inspect the kept raw output — a provider
+error usually arrives as a different event type. Resume is `-s <sessionID>`.
+
+### 20. OpenCode lanes and model selection
+
+- Consult/architect lane runs `--agent plan` (the built-in read-only agent —
+  no edit tools). Implement/junior lane runs the default build agent with
+  `--dangerously-skip-permissions`; without that flag headless runs stall on
+  permission prompts and change nothing.
+- Model: `PAIR_OPENCODE_MODEL=provider/model` (see `opencode models` for the
+  list; free options exist, e.g. `opencode/deepseek-v4-flash-free`). Unset =
+  the CLI's configured default, which may be a paid provider — check before
+  burning quota. Contract details: docs/ADAPTERS.md.
+
 ## Junior gate (engine, any junior agent)
 
-### 18. `pair.sh junior` refuses: "no approval ... on record" / "already consumed"
+### 21. `pair.sh junior` refuses: "no approval ... on record" / "already consumed"
 
 Working as designed, not a bug. Every junior delegation needs a fresh recorded
 approval: `pair.sh junior-approve "<exact task>" "<note>"` then `pair.sh junior
 "<byte-identical task text>"`. The approval is consumed at launch (even if the
 run fails), so a second run always needs a new approval. Task text mismatch →
 refusal that prints both strings.
+
+## Context checkpoints and rollover
+
+### 22. `pair.sh status` says `source=estimate`
+
+Normal for an adapter or CLI version that exposes no recognized usage data.
+Telemetry is optional; the engine estimates tokens from prompt/reply bytes
+(with a conservative write-lane multiplier). `source=usage` means the adapter
+reported final resident input. Raw cumulative spend and resident context are
+different counters and should not be compared as if they were the same.
+
+### 23. A session changed even though the task stayed the same
+
+With `context_policy.mode=auto`, Triad checkpoints once at the soft threshold
+and rolls over at the hard token/percent/call threshold. The old session id is
+stored in `.pair/checkpoints/<role>/NNN.md` and state before it is cleared. The
+next prompt starts fresh and re-grounds from `current.md`. Use `pair.sh status`
+to see the trigger counters. To observe without mutation, set
+`PAIR_CTX_MODE=warn` when initializing a new project, or edit the persisted
+`.context_policy.mode` deliberately for an existing one.
+
+### 24. Fresh session reports `STALENESS WARNING`
+
+The working tree changed after the checkpoint digest was recorded. This is a
+safety signal, not data loss: current requirements, plan, reviews, and git
+state are authoritative. Re-verify checkpoint decisions/paths/tests against
+disk before continuing. Do not silence it by copying the old digest forward.
+
+### 25. Checkpoint says `synthesized:true` / `semantic_valid:false`
+
+The read-only semantic checkpoint call failed, returned malformed JSON, or was
+unavailable. Triad retained an engine-built bounded handoff (git/plan/review/
+log tail) and did not lose the old session id. Re-ground carefully from the
+canonical files. Manual recovery: `pair.sh checkpoint architect` or
+`pair.sh checkpoint implementer`.
+
+### 26. Context policy environment changes appear ignored
+
+Like role assignment, `PAIR_CTX_*` values are captured at `pair.sh init`.
+Afterward `.pair/state.json.context_policy` wins so a resumed workflow cannot
+silently change behavior because a shell exported different thresholds.

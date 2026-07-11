@@ -17,6 +17,7 @@
 #   pair.sh implement "<task>"         drive the implementer headless (architect-side entry)
 #   pair.sh junior-approve "<task>" "<note>"  record the human's one-time approval for a junior task
 #   pair.sh junior "<task>"            delegate an approved basic task to the junior
+#   pair.sh checkpoint [role]          write a context checkpoint (machine metadata + one agent summary)
 #   pair.sh status                     show state
 # Legacy aliases: claude -> implement, qwen -> junior, qwen-approve -> junior-approve.
 #
@@ -38,12 +39,31 @@
 # implement -> the architect, junior -> the implementer), plus whatever env
 # each adapter documents (PAIR_CODEX_MODEL, PAIR_CLAUDE_MODEL/EFFORT,
 # PAIR_QWEN_BIN/APPROVAL, ...).
+# Context policy is captured at init from PAIR_CTX_MODE, PAIR_CTX_SOFT_TOKENS,
+# PAIR_CTX_ROLLOVER_TOKENS, PAIR_CTX_ROLLOVER_PCT, PAIR_CTX_CALL_LIMIT,
+# PAIR_CTX_RAW_WARN_TOKENS, PAIR_CTX_LOG_TAIL, PAIR_CTX_REVIEW_MAX_BYTES,
+# and PAIR_CTX_IMPLEMENT_FACTOR.
+# Persisted state wins after init; these variables do not mutate live policy.
+# 'checkpoint' is manual-only for now: it records a context checkpoint (machine
+# metadata + one agent-authored summary) but never rolls a session over —
+# automatic rollover is a later task.
 
 set -euo pipefail
 
 PROJECT_DIR="$(pwd)"
 PAIR="$PROJECT_DIR/.pair"
 STATE="$PAIR/state.json"
+
+CTX_MODE_DEFAULT="auto"
+CTX_SOFT_TOKENS_DEFAULT=100000
+CTX_ROLLOVER_TOKENS_DEFAULT=150000
+CTX_ROLLOVER_PCT_DEFAULT=70
+CTX_CALL_LIMIT_DEFAULT=20
+CTX_RAW_WARN_TOKENS_DEFAULT=2000000
+CTX_LOG_TAIL_DEFAULT=40
+CTX_REVIEW_MAX_BYTES_DEFAULT=200000
+CTX_IMPLEMENT_FACTOR_DEFAULT=4
+CTX_SYNTH_MAX_BYTES=20000
 
 die() { echo "pair.sh: $*" >&2; exit 1; }
 
@@ -97,6 +117,171 @@ state_set() { # state_set <key> <value>
   jq --arg v "$2" ".$1 = \$v" "$STATE" > "$tmp" && mv "$tmp" "$STATE"
 }
 
+validate_uint() { # validate_uint <env-name> <value> <min> <max>
+  local name="$1" value="$2" min="$3" max="$4"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be an integer (got '$value')"
+  [ "$value" -ge "$min" ] && [ "$value" -le "$max" ] || \
+    die "$name must be between $min and $max (got '$value')"
+}
+
+validate_context_policy_env() {
+  local mode="${PAIR_CTX_MODE:-$CTX_MODE_DEFAULT}"
+  local soft="${PAIR_CTX_SOFT_TOKENS:-$CTX_SOFT_TOKENS_DEFAULT}"
+  local rollover="${PAIR_CTX_ROLLOVER_TOKENS:-$CTX_ROLLOVER_TOKENS_DEFAULT}"
+  case "$mode" in auto|warn|off) ;; *) die "PAIR_CTX_MODE must be auto, warn, or off (got '$mode')" ;; esac
+  validate_uint PAIR_CTX_SOFT_TOKENS "$soft" 1000 100000000
+  validate_uint PAIR_CTX_ROLLOVER_TOKENS "$rollover" 1000 100000000
+  [ "$soft" -le "$rollover" ] || \
+    die "PAIR_CTX_SOFT_TOKENS must be <= PAIR_CTX_ROLLOVER_TOKENS"
+  validate_uint PAIR_CTX_ROLLOVER_PCT "${PAIR_CTX_ROLLOVER_PCT:-$CTX_ROLLOVER_PCT_DEFAULT}" 1 95
+  validate_uint PAIR_CTX_CALL_LIMIT "${PAIR_CTX_CALL_LIMIT:-$CTX_CALL_LIMIT_DEFAULT}" 1 100000
+  validate_uint PAIR_CTX_RAW_WARN_TOKENS "${PAIR_CTX_RAW_WARN_TOKENS:-$CTX_RAW_WARN_TOKENS_DEFAULT}" 1000 1000000000
+  validate_uint PAIR_CTX_LOG_TAIL "${PAIR_CTX_LOG_TAIL:-$CTX_LOG_TAIL_DEFAULT}" 1 10000
+  validate_uint PAIR_CTX_REVIEW_MAX_BYTES "${PAIR_CTX_REVIEW_MAX_BYTES:-$CTX_REVIEW_MAX_BYTES_DEFAULT}" 1024 100000000
+  validate_uint PAIR_CTX_IMPLEMENT_FACTOR "${PAIR_CTX_IMPLEMENT_FACTOR:-$CTX_IMPLEMENT_FACTOR_DEFAULT}" 1 100
+}
+
+ensure_context_schema() { # additive migration; existing values always win
+  local tmp; tmp=$(mktemp)
+  jq \
+    --arg mode "$CTX_MODE_DEFAULT" \
+    --argjson soft "$CTX_SOFT_TOKENS_DEFAULT" \
+    --argjson rollover "$CTX_ROLLOVER_TOKENS_DEFAULT" \
+    --argjson pct "$CTX_ROLLOVER_PCT_DEFAULT" \
+    --argjson calls "$CTX_CALL_LIMIT_DEFAULT" \
+    --argjson raw "$CTX_RAW_WARN_TOKENS_DEFAULT" \
+    --argjson tail "$CTX_LOG_TAIL_DEFAULT" \
+    --argjson review "$CTX_REVIEW_MAX_BYTES_DEFAULT" \
+    --argjson factor "$CTX_IMPLEMENT_FACTOR_DEFAULT" '
+      .context_policy = ({
+        mode: $mode, soft_tokens: $soft, rollover_tokens: $rollover,
+        rollover_pct: $pct, call_limit: $calls, raw_warn_tokens: $raw,
+        log_tail: $tail, review_max_bytes: $review, implement_factor: $factor
+      } + (.context_policy // {}))
+      | .context = (.context // {})
+      | .context.architect = ({resident_input_tokens: 0, context_window: 0,
+          raw_total_tokens: 0, cached_input_tokens: 0, tool_calls: 0,
+          pair_calls: 0, source: "none", checkpoint_due: false,
+          rollover_due: false, soft_checkpoint_done: false, updated_at: null} + (.context.architect // {}))
+      | .context.implementer = ({resident_input_tokens: 0, context_window: 0,
+          raw_total_tokens: 0, cached_input_tokens: 0, tool_calls: 0,
+          pair_calls: 0, source: "none", checkpoint_due: false,
+          rollover_due: false, soft_checkpoint_done: false, updated_at: null} + (.context.implementer // {}))
+      | .context.junior = ({resident_input_tokens: 0, context_window: 0,
+          raw_total_tokens: 0, cached_input_tokens: 0, tool_calls: 0,
+          pair_calls: 0, source: "none", checkpoint_due: false,
+          rollover_due: false, soft_checkpoint_done: false, updated_at: null} + (.context.junior // {}))
+      | .checkpoints = ({architect: [], implementer: [], junior: []} + (.checkpoints // {}))
+    ' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+}
+
+init_context_schema() { # init-time policy capture after validation
+  local tmp; tmp=$(mktemp)
+  jq \
+    --arg mode "${PAIR_CTX_MODE:-$CTX_MODE_DEFAULT}" \
+    --argjson soft "${PAIR_CTX_SOFT_TOKENS:-$CTX_SOFT_TOKENS_DEFAULT}" \
+    --argjson rollover "${PAIR_CTX_ROLLOVER_TOKENS:-$CTX_ROLLOVER_TOKENS_DEFAULT}" \
+    --argjson pct "${PAIR_CTX_ROLLOVER_PCT:-$CTX_ROLLOVER_PCT_DEFAULT}" \
+    --argjson calls "${PAIR_CTX_CALL_LIMIT:-$CTX_CALL_LIMIT_DEFAULT}" \
+    --argjson raw "${PAIR_CTX_RAW_WARN_TOKENS:-$CTX_RAW_WARN_TOKENS_DEFAULT}" \
+    --argjson tail "${PAIR_CTX_LOG_TAIL:-$CTX_LOG_TAIL_DEFAULT}" \
+    --argjson review "${PAIR_CTX_REVIEW_MAX_BYTES:-$CTX_REVIEW_MAX_BYTES_DEFAULT}" \
+    --argjson factor "${PAIR_CTX_IMPLEMENT_FACTOR:-$CTX_IMPLEMENT_FACTOR_DEFAULT}" '
+      .context_policy = {mode: $mode, soft_tokens: $soft,
+        rollover_tokens: $rollover, rollover_pct: $pct, call_limit: $calls,
+        raw_warn_tokens: $raw, log_tail: $tail, review_max_bytes: $review,
+        implement_factor: $factor}
+    ' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+  ensure_context_schema
+}
+
+account_context_call() { # role lane prompt outfile usage-sidecar
+  local role="$1" lane="$2" prompt="$3" outfile="$4" usage="$5"
+  local prompt_bytes output_bytes estimate factor source last_input window call_total cached tools
+  prompt_bytes=$(printf '%s' "$prompt" | wc -c)
+  output_bytes=$(wc -c < "$outfile" 2>/dev/null || echo 0)
+  estimate=$(( (prompt_bytes + output_bytes + 3) / 4 ))
+  factor=$(jq -r '.context_policy.implement_factor // 4' "$STATE")
+  if [ "$lane" = implement ]; then estimate=$((estimate * factor)); fi
+
+  source="estimate"; last_input=""; window=""; call_total=""; cached=0; tools=0
+  if [ -s "$usage" ] && jq -e '
+      type == "object"
+      and ([.last_input_tokens?, .context_window?, .call_total_tokens?,
+            .cached_input_tokens?, .tool_calls?]
+           | map(select(. != null)) | all(type == "number" and . >= 0))
+      and ([.last_input_tokens?, .context_window?, .call_total_tokens?,
+            .cached_input_tokens?, .tool_calls?]
+           | map(select(. != null)) | length > 0)
+    ' "$usage" >/dev/null 2>&1; then
+    last_input=$(jq -r '.last_input_tokens // empty | floor' "$usage")
+    window=$(jq -r '.context_window // empty | floor' "$usage")
+    call_total=$(jq -r '.call_total_tokens // empty | floor' "$usage")
+    cached=$(jq -r '.cached_input_tokens // 0 | floor' "$usage")
+    tools=$(jq -r '.tool_calls // 0 | floor' "$usage")
+    [ -n "$last_input" ] && source="usage"
+  elif [ -s "$usage" ]; then
+    echo "pair.sh: warning: adapter wrote invalid context telemetry; using estimate" >&2
+  fi
+  [ -n "$call_total" ] || call_total="$estimate"
+
+  local tmp ts; tmp=$(mktemp); ts=$(now)
+  jq --arg r "$role" --arg src "$source" --arg ts "$ts" \
+     --argjson est "$estimate" --argjson last "${last_input:-0}" \
+     --argjson win "${window:-0}" --argjson raw "$call_total" \
+     --argjson cached "$cached" --argjson tools "$tools" '
+    (.context[$r] // {}) as $old
+    | (.context_policy // {}) as $p
+    | (($old.resident_input_tokens // 0) + $est) as $estimated_resident
+    | (if $src == "usage" then $last else $estimated_resident end) as $resident
+    | (if $win > 0 then $win else ($old.context_window // 0) end) as $window
+    | (($old.raw_total_tokens // 0) + $raw) as $raw_total
+    | (($old.cached_input_tokens // 0) + $cached) as $cached_total
+    | (($old.tool_calls // 0) + $tools) as $tool_total
+    | (($old.pair_calls // 0) + 1) as $pair_calls
+    | (($resident >= ($p.soft_tokens // 100000))
+       or ($raw_total >= ($p.raw_warn_tokens // 2000000))) as $checkpoint
+    | (($resident >= ($p.rollover_tokens // 150000))
+       or ($pair_calls >= ($p.call_limit // 20))
+       or ($tool_total >= ($p.call_limit // 20))
+       or ($window > 0 and (($resident * 100 / $window) >= ($p.rollover_pct // 70)))) as $rollover
+    | .context[$r] = (($old // {}) + {
+        resident_input_tokens: $resident, context_window: $window,
+        raw_total_tokens: $raw_total, cached_input_tokens: $cached_total,
+        tool_calls: $tool_total, pair_calls: $pair_calls, source: $src,
+        checkpoint_due: $checkpoint, rollover_due: $rollover, updated_at: $ts
+      })
+  ' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+}
+
+dispatch_call() { # role agent verb outfile session prompt lane -> stdout session id only
+  local role="$1" agent="$2" verb="$3" out="$4" sid="$5" prompt="$6" lane="$7"
+  local usage sidout rc=0 PAIR_USAGE_FILE
+  usage=$(mktemp); sidout=$(mktemp)
+  PAIR_USAGE_FILE="$usage" # dynamically scoped for the adapter; not exported to its CLI child
+  if "${agent}_${verb}" "$out" "$sid" "$prompt" > "$sidout"; then
+    account_context_call "$role" "$lane" "$prompt" "$out" "$usage"
+  else
+    rc=$?
+  fi
+  cat "$sidout"
+  rm -f "$usage" "$sidout"
+  return "$rc"
+}
+
+dispatch_review() { # role agent outfile session prompt -> native review, no stdout contract
+  local role="$1" agent="$2" out="$3" sid="$4" prompt="$5" usage rc=0 PAIR_USAGE_FILE
+  usage=$(mktemp)
+  PAIR_USAGE_FILE="$usage" # adapter-only sidecar path; do not expose it to the agent CLI
+  if "${agent}_review" "$out" "$sid" "$prompt"; then
+    account_context_call "$role" consult "$prompt" "$out" "$usage"
+  else
+    rc=$?
+  fi
+  rm -f "$usage"
+  return "$rc"
+}
+
 default_human() {
   local h="${PAIR_HUMAN:-}"
   if [ -z "$h" ]; then h=$(git config user.name 2>/dev/null || true); fi
@@ -104,20 +289,23 @@ default_human() {
   printf '%s' "$h"
 }
 
-migrate_state() { # legacy (hardcoded codex/claude/qwen) state.json -> role-keyed schema
-  if jq -e '.roles' "$STATE" >/dev/null 2>&1; then return 0; fi
-  echo "pair.sh: migrating legacy state.json to the role-keyed schema" >&2
-  local tmp; tmp=$(mktemp)
-  jq --arg human "$(default_human)" '
-    .roles = {architect: "codex", implementer: "claude", junior: "qwen"}
-    | .human = (.human // $human)
-    | .sessions = ((.sessions // {})
-        + (if .codex_session_id  then {architect:   {agent: "codex",  id: .codex_session_id}}  else {} end)
-        + (if .claude_session_id then {implementer: {agent: "claude", id: .claude_session_id}} else {} end)
-        + (if .qwen_session_id   then {junior:      {agent: "qwen",   id: .qwen_session_id}}   else {} end))
-    | (if .qwen_approval then .junior_approval = .qwen_approval else . end)
-    | del(.codex_session_id, .claude_session_id, .qwen_session_id, .qwen_approval)
-  ' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+migrate_state() { # legacy role migration plus additive context schema
+  local tmp
+  if ! jq -e '.roles' "$STATE" >/dev/null 2>&1; then
+    echo "pair.sh: migrating legacy state.json to the role-keyed schema" >&2
+    tmp=$(mktemp)
+    jq --arg human "$(default_human)" '
+      .roles = {architect: "codex", implementer: "claude", junior: "qwen"}
+      | .human = (.human // $human)
+      | .sessions = ((.sessions // {})
+          + (if .codex_session_id  then {architect:   {agent: "codex",  id: .codex_session_id}}  else {} end)
+          + (if .claude_session_id then {implementer: {agent: "claude", id: .claude_session_id}} else {} end)
+          + (if .qwen_session_id   then {junior:      {agent: "qwen",   id: .qwen_session_id}}   else {} end))
+      | (if .qwen_approval then .junior_approval = .qwen_approval else . end)
+      | del(.codex_session_id, .claude_session_id, .qwen_session_id, .qwen_approval)
+    ' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+  fi
+  ensure_context_schema
 }
 
 session_get() { # session_get <role> -> id; empty (fresh) if the role was reassigned
@@ -149,7 +337,7 @@ untracked_diff_context() {
     printf '\n--- untracked: %s ---\n' "$f"
     if [ -f "$f" ]; then
       tmp=$(mktemp)
-      if git diff --no-index -- /dev/null "$f" > "$tmp" 2>/dev/null; then
+      if git diff --binary --no-index -- /dev/null "$f" > "$tmp" 2>/dev/null; then
         cat "$tmp"
       else
         rc=$?
@@ -194,6 +382,449 @@ resolve_roles() { # after need_state+migrate_state: read roles/human, load adapt
   IMPL_NAME=$(display_of "$IMPL")
 }
 
+# ── checkpoint helpers (T-C3) ────────────────────────────────────────────────
+checkpoint_digest() { # binary-safe, content-sensitive working-tree digest (SHA-256).
+  # Covers tracked changes vs HEAD + staged state + untracked non-ignored
+  # contents. `--binary` emits literal GIT binary patches so two *different*
+  # binary blobs never collapse to the same "Binary files differ" marker;
+  # untracked bytes are length-framed and symlink targets captured, so broken or
+  # unusual entries still change the digest. Any content change (even untracked,
+  # HEAD unchanged) yields a different digest.
+  local head len f
+  head=$(git rev-parse HEAD 2>/dev/null || echo none)
+  {
+    printf 'HEAD\0%s\0' "$head"
+    printf 'TRACKED\0'
+    if [ "$head" = none ]; then git diff --binary 2>/dev/null || true
+    else git diff --binary HEAD 2>/dev/null || true; fi
+    printf '\0STAGED\0'
+    if [ "$head" = none ]; then git diff --cached --binary 2>/dev/null || true
+    else git diff --cached --binary HEAD 2>/dev/null || true; fi
+    printf '\0UNTRACKED\0'
+    while IFS= read -r -d '' f; do
+      if [ -L "$f" ]; then
+        printf '%s\0symlink\0%s\0' "$f" "$(readlink -- "$f" 2>/dev/null || echo '?')"
+      elif [ -f "$f" ]; then
+        len=$(wc -c < "$f" 2>/dev/null || echo 0)
+        printf '%s\0file\0%s\0' "$f" "$len"
+        cat -- "$f" 2>/dev/null || true
+        printf '\0'
+      else
+        printf '%s\0other\0\0' "$f"   # fifo/socket/dir-symlink etc.
+      fi
+    done < <(git ls-files -z --others --exclude-standard 2>/dev/null)
+  } | sha256sum | awk '{print $1}'
+}
+
+# Schema for the agent-authored semantic summary. A valid checkpoint summary is
+# a single JSON object with every field present, correctly typed, and non-empty;
+# decisions are decision+rationale object pairs. Empty strings, missing keys,
+# wrong types, or non-JSON prose are all INVALID.
+CKPT_SCHEMA='
+  def ne: type=="string" and (gsub("^\\s+|\\s+$";"") | length>0);
+  def nelist: (ne) or (type=="array" and length>0 and all(.[]; ne));
+  type=="object"
+  and (has("goals") and (.goals|nelist))
+  and (has("decisions") and (.decisions|type=="array" and length>0
+        and all(.[]; type=="object"
+                     and has("decision") and (.decision|ne)
+                     and has("rationale") and (.rationale|ne))))
+  and (has("blockers") and (.blockers|nelist))
+  and (has("approvals_pending") and (.approvals_pending|nelist))
+  and (has("next_actions") and (.next_actions|nelist))
+  and (has("paths") and (.paths|nelist))
+  and (has("tests") and (.tests|nelist))
+'
+
+checkpoint_semantic_ok() { # <raw_outfile> <normalized_json_out>
+  # Strip ```json / ``` fences, then require a schema-valid JSON object. On
+  # success writes canonical (pretty) JSON to <normalized_json_out>.
+  local f="$1" norm="$2" tmp; tmp=$(mktemp)
+  sed -e 's/^[[:space:]]*```[a-zA-Z0-9]*[[:space:]]*$//' \
+      -e 's/^[[:space:]]*```[[:space:]]*$//' "$f" > "$tmp"
+  if jq -e "$CKPT_SCHEMA" "$tmp" >/dev/null 2>&1; then
+    jq '.' "$tmp" > "$norm"; rm -f "$tmp"; return 0
+  fi
+  rm -f "$tmp"; return 1
+}
+
+checkpoint_synth_body() { # <role> <note> — engine-only synthesized handoff body
+  # (bounded git/plan/review/log context; no agent call). Used for mechanical /
+  # synthesized checkpoints so a fresh session can still re-ground from disk.
+  local role="$1" note="$2" tail_n rv raw total omitted
+  tail_n=$(log_tail_n)                          # single consistent bound for every view
+  raw=$(mktemp)
+  {
+    printf '%s\n\n' "$note"
+    printf '## synthesized handoff (engine mechanical fallback — verify against disk)\n'
+    printf 'git_head: %s\n' "$(git rev-parse HEAD 2>/dev/null || echo '(no commits)')"
+    printf 'git_status (first %s lines):\n' "$tail_n"; git status --short 2>/dev/null | head -n "$tail_n" || true
+    printf '\nplan.md focus (tail -%s):\n' "$tail_n"; tail -n "$tail_n" "$PAIR/plan.md" 2>/dev/null || true
+    printf '\nlatest review verdict:\n'
+    rv=$(ls "$PAIR/reviews" 2>/dev/null | grep '^[0-9]' | tail -1 || true)
+    if [ -n "$rv" ]; then grep -h '^VERDICT:' "$PAIR/reviews/$rv" 2>/dev/null || echo "(no verdict line in $rv)"; else echo "(no reviews yet)"; fi
+    printf '\nrecent log (tail -%s):\n' "$tail_n"; tail -n "$tail_n" "$PAIR/log.md" 2>/dev/null || true
+  } > "$raw"
+  total=$(wc -c < "$raw")
+  if [ "$total" -gt "$CTX_SYNTH_MAX_BYTES" ]; then
+    head -c "$CTX_SYNTH_MAX_BYTES" "$raw"
+    omitted=$((total - CTX_SYNTH_MAX_BYTES))
+    printf '\n\n=== [TRUNCATED] synthesized handoff capped at %s bytes; %s bytes omitted from the combined end. Re-read canonical .pair files directly. ===\n' \
+      "$CTX_SYNTH_MAX_BYTES" "$omitted"
+  else
+    cat "$raw"
+  fi
+  rm -f "$raw"
+}
+
+checkpoint_role() { # <role> [reason] [force_mechanical] — writes a schema-complete
+  # MECHANICAL checkpoint (history NNN.md + current.md + state entry) BEFORE any
+  # agent call, then atomically enriches it with a validated JSON semantic
+  # summary. reason parameterizes the record; force_mechanical=1 skips the agent
+  # call entirely (synthesized fallback, e.g. a dead session). Never clears the
+  # session (the caller does the switch), never touches junior_approval, and
+  # never invokes the junior adapter (junior/consult-less agents are mechanical).
+  local role="$1" reason="${2:-manual}" force_mech="${3:-0}" \
+        agent sid name digest head dir n ts file new_sid rc \
+        n_int meta out norm mechanical_only=0 note
+  agent=$(jq -r ".roles.$role // empty" "$STATE")
+  [ -n "$agent" ] || { echo "pair.sh: no $role role configured — skipping" >&2; return 0; }
+  sid=$(session_get "$role")
+  name=$(display_of "$agent")
+  digest=$(checkpoint_digest)
+  head=$(git rev-parse HEAD 2>/dev/null || echo "(no commits)")
+  dir="$PAIR/checkpoints/$role"; mkdir -p "$dir"
+  n=$(next_seq "$dir"); n_int=$((10#$n))
+  ts=$(now); file="checkpoints/$role/$n.md"
+
+  # a checkpoint may only use a READ-ONLY consult lane. The junior adapter is
+  # never called; nor is any implement-only agent (that would be write-capable).
+  note="(semantic summary pending — mechanical record written before the agent call)"
+  if [ "$force_mech" = 1 ]; then
+    mechanical_only=1
+    note="(synthesized checkpoint (reason=$reason): engine mechanical fallback — no agent call)"
+  elif [ "$role" = junior ]; then
+    mechanical_only=1
+    note="(junior role: mechanical checkpoint only — the junior adapter is never invoked; the one-time approval is untouched)"
+  elif [ -z "$sid" ]; then
+    mechanical_only=1
+    note="(no live $role session — mechanical checkpoint only; semantic summary unavailable)"
+  elif ! declare -F "${agent}_consult" >/dev/null; then
+    mechanical_only=1
+    note="(mechanical checkpoint only — agent '$agent' has no read-only consult lane; semantic summary omitted by design)"
+  fi
+
+  # metadata header, built once; identical in the mechanical and enriched files
+  meta="$(agent_header "$name")
+# CHECKPOINT $role #$n
+reason: $reason
+session_id: ${sid:-(none)}
+agent: $agent
+git_head: $head
+digest: $digest
+$(jq -r --arg r "$role" '(.context[$r] // {}) |
+    "resident_input_tokens: \(.resident_input_tokens // 0)",
+    "context_window: \(.context_window // 0)",
+    "raw_total_tokens: \(.raw_total_tokens // 0)",
+    "cached_input_tokens: \(.cached_input_tokens // 0)",
+    "tool_calls: \(.tool_calls // 0)",
+    "pair_calls: \(.pair_calls // 0)"' "$STATE")"
+
+  emit_ckpt() { # <sem_valid> <body_file> — atomically (re)write NNN.md + current.md
+    local sv="$1" body="$2" t="$PAIR/$file.tmp.$$"
+    { printf '%s\n' "$meta"
+      printf 'semantic_valid: %s\n' "$sv"
+      printf -- '--- SEMANTIC SUMMARY (valid=%s) ---\n' "$sv"
+      cat "$body"
+    } > "$t" && mv "$t" "$PAIR/$file" && cp "$PAIR/$file" "$dir/current.md"
+  }
+
+  # ── persist a schema-complete mechanical checkpoint FIRST, in the exact
+  # durable order: history -> current -> log -> checkpoint state record. A
+  # failure at any earlier step (set -e) aborts before the caller's switch.
+  # synthesized:true until a valid agent summary enriches it.
+  out=$(mktemp); printf '%s\n' "$note" > "$out"
+  emit_ckpt false "$out"                       # (1) history NNN.md  (2) current.md
+  log "$name" "Checkpoint #$n mechanical record written ($file, reason=$reason). session=${sid:-(none)} head=$head digest=${digest:0:12}"   # (3) log
+  local tmp; tmp=$(mktemp)                       # (4) checkpoint state record
+  jq --arg r "$role" --argjson n "$n_int" --arg at "$ts" --arg sid "${sid:-}" \
+     --arg head "$head" --arg digest "$digest" --arg file "$file" --arg reason "$reason" '
+     .checkpoints[$r] = ((.checkpoints[$r] // []) + [{
+       n: $n, at: $at, reason: $reason, session_id: $sid, git_head: $head,
+       digest: $digest, semantic_valid: false, synthesized: true, file: $file,
+       counters: {
+         resident_input_tokens: (.context[$r].resident_input_tokens // 0),
+         raw_total_tokens: (.context[$r].raw_total_tokens // 0),
+         pair_calls: (.context[$r].pair_calls // 0),
+         tool_calls: (.context[$r].tool_calls // 0)
+       }
+     }])' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+
+  if [ "$mechanical_only" = 1 ]; then
+    # enrich the body with a bounded synthesized handoff (still synthesized:true)
+    checkpoint_synth_body "$role" "$note" > "$out"
+    emit_ckpt false "$out"
+    rm -f "$out"
+    echo "pair.sh: $role checkpoint #$n -> .pair/$file (mechanical/synthesized only)"
+    return 0
+  fi
+
+  # ── the single semantic call (read-only consult lane) ──
+  local cp_prompt
+  cp_prompt="You are the $name ($role role) in a Triad protocol. This is a CONTEXT
+CHECKPOINT, not a task: do NOT create, edit, or delete any file. Re-read
+.pair/requirements.md, .pair/plan.md, the latest .pair/reviews/, and
+tail -$(jq -r '.context_policy.log_tail // 40' "$STATE") .pair/log.md as needed.
+$(budget_reminder readonly)
+Output ONLY a single JSON object (no prose, no code fences) with EXACTLY these keys,
+every field present, correctly typed, and NON-EMPTY; never include secrets,
+credentials, API keys, or env values:
+{
+  \"goals\": \"<what this session is trying to achieve>\",
+  \"decisions\": [ {\"decision\": \"<what was decided>\", \"rationale\": \"<why>\"} ],
+  \"blockers\": \"<blockers, or 'none'>\",
+  \"approvals_pending\": \"<commits/sensitive/major changes awaiting the human, or 'none'>\",
+  \"next_actions\": [ \"<ordered concrete next step>\" ],
+  \"paths\": [ \"<exact file touched or owned this phase>\" ],
+  \"tests\": \"<how to verify + last known result>\"
+}"
+  rc=0
+  new_sid=$(dispatch_call "$role" "$agent" consult "$out" "$sid" "$cp_prompt" consult) || rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "pair.sh: warning: $name checkpoint call failed (exit $rc) — synthesized fallback kept" >&2
+    checkpoint_synth_body "$role" "(checkpoint call failed, exit $rc — synthesized fallback; semantic summary unavailable)" > "$out"
+    emit_ckpt false "$out"; rm -f "$out"        # record stays synthesized:true (never flipped)
+    echo "pair.sh: $role checkpoint #$n -> .pair/$file (synthesized; agent call failed)"
+    return 0
+  fi
+  [ -n "$new_sid" ] && session_set "$role" "$agent" "$new_sid"
+
+  norm=$(mktemp)
+  if checkpoint_semantic_ok "$out" "$norm"; then
+    # ── finding 4: atomically enrich the SAME checkpoint after validation ──
+    emit_ckpt true "$norm"
+    tmp=$(mktemp)
+    jq --arg r "$role" '.checkpoints[$r][-1].semantic_valid = true
+                        | .checkpoints[$r][-1].synthesized = false' \
+       "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+    log "$name" "Checkpoint #$n enriched with a validated semantic summary."
+    echo "pair.sh: $role checkpoint #$n -> .pair/$file (semantic_valid=true)"
+  else
+    echo "pair.sh: warning: $name checkpoint summary is not schema-valid JSON — synthesized fallback kept" >&2
+    checkpoint_synth_body "$role" "(agent summary rejected: not a schema-valid JSON checkpoint — synthesized fallback)" > "$out"
+    emit_ckpt false "$out"                       # record stays synthesized:true
+    echo "pair.sh: $role checkpoint #$n -> .pair/$file (synthesized; summary rejected)"
+  fi
+  rm -f "$out" "$norm"
+}
+
+# ── bounded context bundles / budget prompts (T-C5) ──────────────────────────
+log_tail_n() { jq -r '.context_policy.log_tail // 40' "$STATE"; }
+
+budget_reminder() { # [readonly] — concise per-call context-budget reminder
+  local mode="${1:-write}" lt; lt=$(log_tail_n)
+  cat <<EOF
+Context budget: sessions are disposable — .pair/ on disk is the source of truth.
+For .pair/log.md read only the last $lt lines (tail -$lt), never the whole file.
+Keep routine output to ~100 lines / ~2K tokens and active diagnostics to ~250
+lines / ~5K tokens.
+EOF
+  if [ "$mode" = readonly ]; then
+    printf '%s\n' 'You are read-only: do not create files; summarize verbose evidence and identify the exact path/command needed for deeper inspection.'
+  else
+    printf '%s\n' 'Write anything more verbose to a file and summarize it in the reply rather than pasting it.'
+  fi
+}
+
+review_context_file() { # <bundle_out> <cap_bytes> — build the fallback-review
+  # context (status + untracked + binary diff) via a binary-safe temp-FILE pipeline
+  # (never loading the uncapped diff into a shell variable) and cap the COMBINED
+  # bundle to <cap_bytes>, appending an explicit truncation marker with the
+  # omitted byte count and what/where was dropped.
+  local out="$1" cap="$2" raw total omitted
+  raw=$(mktemp)
+  {
+    printf '=== git status (short) ===\n'; git status --short 2>/dev/null || true
+    printf '\n=== untracked files ===\n'; git ls-files --others --exclude-standard 2>/dev/null || true
+    printf '\n=== untracked file contents ===\n'; untracked_diff_context 2>/dev/null || true
+    printf '\n=== git diff HEAD ===\n'
+    if git rev-parse HEAD >/dev/null 2>&1; then git diff --binary HEAD 2>/dev/null || true
+    else printf '(no commits yet — every file is new/untracked)\n'; fi
+  } > "$raw"                                   # streamed to a FILE, uncapped, never a variable
+  total=$(wc -c < "$raw")
+  if [ "$total" -gt "$cap" ]; then
+    head -c "$cap" "$raw" > "$out"             # byte-safe cap on the combined bundle
+    omitted=$((total - cap))
+    printf '\n\n=== [TRUNCATED] review bundle capped at %s bytes (context_policy.review_max_bytes); %s bytes omitted from the END of the combined status/untracked/diff bundle. Run `git diff --binary HEAD` and `git status` yourself for the complete picture. ===\n' "$cap" "$omitted" >> "$out"
+  else
+    cp "$raw" "$out"
+  fi
+  rm -f "$raw"
+}
+
+# ── rollover / re-grounding / recovery helpers (T-C4) ────────────────────────
+# Reserved adapter exit code: a _consult/_implement/_review that returns 3
+# (PAIR_RC_NO_SESSION) signals "the given session id could not be resumed"
+# (session-not-found). Only that specific failure earns a single fresh retry;
+# any other nonzero exit is a genuine task failure and is never retried.
+
+rollover_switch() { # <role> — clear the (already-checkpointed) session and reset
+  # per-session PRESSURE counters + the soft-checkpoint marker; PRESERVE lifetime
+  # raw_total_tokens and cached_input_tokens (cumulative spend outlives a session).
+  local r="$1" tmp; tmp=$(mktemp)
+  jq --arg r "$r" '
+      (if .sessions[$r] then .sessions[$r].id = "" else . end)
+    | .context[$r].resident_input_tokens = 0
+    | .context[$r].context_window = 0
+    | .context[$r].tool_calls = 0
+    | .context[$r].pair_calls = 0
+    | .context[$r].checkpoint_due = false
+    | .context[$r].rollover_due = false
+    | .context[$r].soft_checkpoint_done = false
+  ' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+}
+
+handoff_preamble() { # <role> -> re-grounding preamble IF a checkpoint exists (else
+  # empty). Injected only on a fresh (post-rollover) session. Compares the
+  # recorded digest to the current one and warns when the tree has moved on.
+  local role="$1" rec_digest cur_digest file stale tail_n
+  file=$(jq -r --arg r "$role" '.checkpoints[$r] // [] | (last // {}) | .file // empty' "$STATE")
+  [ -n "$file" ] || return 0
+  rec_digest=$(jq -r --arg r "$role" '.checkpoints[$r] | last | .digest // ""' "$STATE")
+  cur_digest=$(checkpoint_digest)
+  tail_n=$(jq -r '.context_policy.log_tail // 40' "$STATE")
+  stale=""
+  if [ -n "$rec_digest" ] && [ "$rec_digest" != "$cur_digest" ]; then
+    stale="STALENESS WARNING: the working tree changed since this handoff was written
+(recorded digest ${rec_digest:0:12} != current ${cur_digest:0:12}). DISK IS
+AUTHORITATIVE — re-verify every decision/path/test against the CURRENT code first.
+"
+  fi
+  printf '%s' "[CONTEXT ROLLOVER] You are resuming the $role role on a FRESH session after a
+context rollover. Previous session handoff: .pair/checkpoints/$role/current.md
+(latest record .pair/$file), recorded working-tree digest ${rec_digest:0:12}.
+Before anything else, re-read .pair/requirements.md, .pair/plan.md, the latest
+.pair/reviews/, that handoff file, and tail -$tail_n .pair/log.md. Those files are the
+canonical truth — trust DISK over the handoff on any conflict.
+$stale
+--- your task follows ---
+"
+}
+
+maybe_rollover() { # <role> — pre-dispatch check for ask/suggest/review/implement.
+  # NEVER junior. off: inert. warn: report soft/rollover pressure, no mutation.
+  # auto: rollover (checkpoint+switch) when rollover_due; otherwise ONE proactive
+  # no-switch checkpoint per live session when checkpoint_due (soft threshold).
+  local role="$1" mode roll soft done sid tmp
+  [ "$role" = junior ] && return 0
+  mode=$(jq -r '.context_policy.mode // "auto"' "$STATE")
+  [ "$mode" = off ] && return 0
+  roll=$(jq -r --arg r "$role" '.context[$r].rollover_due // false' "$STATE")
+  soft=$(jq -r --arg r "$role" '.context[$r].checkpoint_due // false' "$STATE")
+  sid=$(jq -r --arg r "$role" '.sessions[$r].id // empty' "$STATE")
+
+  if [ "$mode" = warn ]; then
+    if [ "$roll" = true ]; then
+      echo "pair.sh: note: $role is over the ROLLOVER threshold — consider 'pair.sh checkpoint $role' (mode=warn: not acting)" >&2
+    elif [ "$soft" = true ]; then
+      echo "pair.sh: note: $role is over the soft CHECKPOINT threshold — consider 'pair.sh checkpoint $role' (mode=warn: not acting)" >&2
+    fi
+    return 0
+  fi
+
+  # ── auto ──
+  if [ "$roll" = true ]; then
+    [ -n "$sid" ] || return 0   # nothing live to roll
+    echo "pair.sh: auto-rollover: $role over threshold — checkpoint then fresh session" >&2
+    checkpoint_role "$role" rollover-auto      # durable history->current->log->state
+    rollover_switch "$role"                     # ...only THEN clear session + counters + soft marker
+    echo "pair.sh: auto-rollover: $role rolled; the next call re-grounds from the handoff" >&2
+    return 0
+  fi
+  # proactive soft checkpoint: once per live session, NO switch
+  done=$(jq -r --arg r "$role" '.context[$r].soft_checkpoint_done // false' "$STATE")
+  if [ "$soft" = true ] && [ "$done" != true ] && [ -n "$sid" ]; then
+    echo "pair.sh: auto-checkpoint: $role over the soft threshold — one proactive checkpoint (no switch)" >&2
+    checkpoint_role "$role" soft-auto
+    tmp=$(mktemp)
+    jq --arg r "$role" '.context[$r].soft_checkpoint_done = true' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+  fi
+}
+
+role_dispatch() { # <role> <agent> <verb> <lane> <outfile> <base_prompt>
+  # Inject the handoff preamble on a fresh session, dispatch, and on a genuine
+  # resume failure (rc==3) retry EXACTLY once with a fresh session — architect/
+  # implementer only. Persists the session; prints the new session id.
+  local role="$1" agent="$2" verb="$3" lane="$4" out="$5" prompt="$6"
+  local sid full new_sid rc
+  sid=$(session_get "$role")
+  full="$prompt"; [ -z "$sid" ] && full="$(handoff_preamble "$role")$prompt"
+  rc=0; new_sid=$(dispatch_call "$role" "$agent" "$verb" "$out" "$sid" "$full" "$lane") || rc=$?
+  if [ "$rc" = 0 ]; then
+    [ -n "$new_sid" ] && session_set "$role" "$agent" "$new_sid"
+    printf '%s' "$new_sid"; return 0
+  fi
+  if [ "$rc" = 3 ] && [ -n "$sid" ] && { [ "$role" = architect ] || [ "$role" = implementer ]; }; then
+    echo "pair.sh: $role session '$sid' could not be resumed (rc=3) — synthesized checkpoint + one fresh retry" >&2
+    # Log only non-content metadata about the discarded diagnostic (byte count
+    # and SHA-256) so the durable log cannot leak diagnostic content
+    # or grow without bound — then TRUNCATE the result file so stale failure
+    # output cannot contaminate the successful retry's task output.
+    if [ -s "$out" ]; then
+      local dbytes dsha
+      dbytes=$(wc -c < "$out")
+      dsha=$(sha256sum "$out" | awk '{print $1}')
+      log "$(display_of "$agent")" "resume-failure on session $sid (rc=3): discarded ${dbytes}B of diagnostic from task output (sha256=$dsha; content not persisted)"
+    fi
+    checkpoint_role "$role" resume-failure 1   # dead session: mechanical/synthesized, old id recorded
+    rollover_switch "$role"                     # clear the dead session before retrying
+    : > "$out"                                  # clean slate for the retry output
+    full="$(handoff_preamble "$role")$prompt"
+    rc=0; new_sid=$(dispatch_call "$role" "$agent" "$verb" "$out" "" "$full" "$lane") || rc=$?
+    if [ "$rc" = 0 ]; then
+      [ -n "$new_sid" ] && session_set "$role" "$agent" "$new_sid"
+      printf '%s' "$new_sid"; return 0
+    fi
+  fi
+  return "$rc"   # arbitrary failures (and post-retry failures) are NOT retried
+}
+
+architect_review_dispatch() { # <outfile> <review_prompt> -> rc; native or fallback
+  # review with handoff injection + a single genuine-resume-failure retry. Rewrites
+  # the outfile fresh each attempt (header + body) so a retry never duplicates.
+  local out="$1" rp="$2" sid full rc new_sid fresh=0 CAP BUNDLE TMP
+  sid=$(session_get architect)
+  while :; do
+    full="$rp"; [ -z "$sid" ] && full="$(handoff_preamble architect)$rp"
+    agent_header "$ARCH_NAME" > "$out"     # fresh header each attempt (no duplication)
+    rc=0
+    if declare -F "${ARCH}_review" >/dev/null; then
+      dispatch_review architect "$ARCH" "$out" "$sid" "$full" || rc=$?   # native review: unchanged
+    else
+      # generic fallback: build a binary-safe, review_max_bytes-capped context
+      # bundle in a FILE (never load the uncapped diff into a shell variable).
+      CAP=$(jq -r '.context_policy.review_max_bytes // 200000' "$STATE")
+      BUNDLE=$(mktemp); review_context_file "$BUNDLE" "$CAP"
+      TMP=$(mktemp)
+      new_sid=$(dispatch_call architect "$ARCH" consult "$TMP" "$sid" "$full
+
+$(cat "$BUNDLE")" consult) || rc=$?
+      cat "$TMP" >> "$out"; rm -f "$TMP" "$BUNDLE"
+      if [ "$rc" = 0 ] && [ -n "$new_sid" ]; then session_set architect "$ARCH" "$new_sid"; fi
+    fi
+    [ "$rc" = 0 ] && return 0
+    if [ "$rc" = 3 ] && [ -n "$sid" ] && [ "$fresh" = 0 ]; then
+      fresh=1
+      echo "pair.sh: architect session '$sid' could not be resumed (rc=3) — synthesized checkpoint + one fresh retry" >&2
+      checkpoint_role architect resume-failure 1
+      rollover_switch architect
+      sid=""
+      continue
+    fi
+    return "$rc"
+  done
+}
+
 cmd="${1:-}"; shift || true
 
 # legacy aliases from the hardcoded era — subcommands are role-named now
@@ -208,6 +839,7 @@ case "$cmd" in
 init)
   BRIEF="${1:-}"; [ -n "$BRIEF" ] || die 'usage: pair.sh init "<project brief>"'
   [ -d "$PAIR" ] && die ".pair/ already exists — protocol already initialized"
+  validate_context_policy_env
   ARCH="${PAIR_ARCHITECT:-codex}"
   IMPL="${PAIR_IMPLEMENTER:-claude}"
   JR="${PAIR_JUNIOR-qwen}"   # PAIR_JUNIOR= (set empty) disables the junior lane
@@ -236,6 +868,7 @@ init)
   TMP=$(mktemp)
   jq --arg a "$ARCH" --arg i "$IMPL" --arg j "$JR" \
      '.roles = {architect: $a, implementer: $i, junior: $j}' "$STATE" > "$TMP" && mv "$TMP" "$STATE"
+  init_context_schema
   printf '# Pair log — %s\n' "$PROJECT_DIR" > "$PAIR/log.md"
   log "$HUMAN" "Project brief:
 $BRIEF"
@@ -248,6 +881,7 @@ $BRIEF"
 $IMPL_NAME is the IMPLEMENTER and writes all code; you MUST NOT create, edit,
 or delete any file — read-only inspection and analysis only. Read the existing
 code in this directory if any, then produce, exactly in this format:
+$(budget_reminder readonly)
 
 === REQUIREMENTS ===
 Your full understanding of the project: goals, constraints, non-goals,
@@ -260,7 +894,7 @@ and a verifiable done-condition. Keep tasks small enough to review one at a time
 
 Project brief:
 $BRIEF"
-  SID=$("${ARCH}_consult" "$OUT" "" "$PROMPT") || die "architect intake failed (output kept at $OUT)"
+  SID=$(dispatch_call architect "$ARCH" consult "$OUT" "" "$PROMPT" consult) || die "architect intake failed (output kept at $OUT)"
   [ -n "$SID" ] || die "architect adapter returned no session id"
   session_set architect "$ARCH" "$SID"
 
@@ -281,19 +915,20 @@ $BRIEF"
 ask|suggest)
   need_state; migrate_state; resolve_roles
   MSG="${1:-}"; [ -n "$MSG" ] || die "usage: pair.sh $cmd \"<message>\""
-  SID=$(session_get architect)
+  maybe_rollover architect        # only after arg validation — never roll then fail on usage
   OUT=$(mktemp)
   PREFIX="Question from the implementer ($IMPL_NAME):"
   if [ "$cmd" = suggest ]; then
     PREFIX="Suggestion from the implementer ($IMPL_NAME). Rule on it: ACCEPT (say how the plan changes) or REJECT (say why). If accepted, output the amended plan section in full so it can be transcribed into plan.md:"
   fi
   PROMPT="Reminder: you are the architect ($ARCH_NAME); do not create, edit, or delete files.
-Shared context lives in .pair/ (requirements.md, plan.md, log.md).
+Shared context lives in .pair/ (requirements.md, plan.md; for log.md read tail -$(log_tail_n) only).
+$(budget_reminder readonly)
 $PREFIX
 
 $MSG"
-  NEW_SID=$("${ARCH}_consult" "$OUT" "$SID" "$PROMPT") || die "architect call failed (output kept at $OUT)"
-  if [ -n "$NEW_SID" ]; then session_set architect "$ARCH" "$NEW_SID"; fi
+  role_dispatch architect "$ARCH" consult consult "$OUT" "$PROMPT" >/dev/null \
+    || die "architect call failed (output kept at $OUT)"
   if [ "$cmd" = suggest ]; then
     N=$(next_seq "$PAIR/suggestions")
     { agent_header "$IMPL_NAME"; echo "$MSG"; echo; agent_header "$ARCH_NAME"; cat "$OUT"; } \
@@ -309,6 +944,7 @@ $MSG"
 
 review)
   need_state; migrate_state; resolve_roles
+  maybe_rollover architect
   NOTES="${1:-}"
   N=$(next_seq "$PAIR/reviews")
   OUTFILE="$PAIR/reviews/$N.md"
@@ -326,37 +962,14 @@ back to $IMPL_NAME to redo; $JR_NAME gets no retry loop."
   REVIEW_PROMPT="$REVIEW_PROMPT
 End with a verdict line: VERDICT: APPROVED or VERDICT: CHANGES_REQUIRED
 followed by a numbered findings list (file:line, severity, fix).
+$(budget_reminder readonly)
 $NOTES"
   echo "pair.sh: running $ARCH_NAME review of uncommitted changes..."
-  agent_header "$ARCH_NAME" > "$OUTFILE"
+  # native review (if the adapter has one) or the generic diff-embedded consult
+  # fallback, with fresh-session handoff injection + one genuine-resume retry.
+  # NOTE: a very large diff may blow the context window (bounded in T-C5).
   RC=0
-  if declare -F "${ARCH}_review" >/dev/null; then
-    "${ARCH}_review" "$OUTFILE" "$(session_get architect)" "$REVIEW_PROMPT" || RC=$?
-  else
-    # generic fallback: no native review command — consult the architect
-    # session with the diff embedded (a read-only consult may not be able to
-    # run git itself). NOTE: a very large diff may blow the context window.
-    SID=$(session_get architect)
-    if git rev-parse HEAD >/dev/null 2>&1; then
-      DIFF=$(git diff HEAD)
-    else
-      DIFF="(no commits yet — every file is new/untracked)"
-    fi
-    CTX="=== git status ===
-$(git status --short)
-=== untracked files ===
-$(git ls-files --others --exclude-standard)
-=== untracked file contents ===
-$(untracked_diff_context)
-=== git diff HEAD ===
-$DIFF"
-    TMP=$(mktemp)
-    NEW_SID=$("${ARCH}_consult" "$TMP" "$SID" "$REVIEW_PROMPT
-
-$CTX") || RC=$?
-    cat "$TMP" >> "$OUTFILE"; rm -f "$TMP"
-    if [ -n "${NEW_SID:-}" ]; then session_set architect "$ARCH" "$NEW_SID"; fi
-  fi
+  architect_review_dispatch "$OUTFILE" "$REVIEW_PROMPT" || RC=$?
   log "$ARCH_NAME" "Review #$N written to reviews/$N.md (exit $RC)"
   echo "pair.sh: review saved -> $OUTFILE"
   tail -40 "$OUTFILE"
@@ -365,10 +978,12 @@ $CTX") || RC=$?
 implement)
   need_state; migrate_state; resolve_roles
   TASK="${1:-}"; [ -n "$TASK" ] || die 'usage: pair.sh implement "<task>"'
-  SID=$(session_get implementer)
+  maybe_rollover implementer      # only after arg validation — never roll then fail on usage
   OUT=$(mktemp)
   PROMPT="You are the IMPLEMENTER ($IMPL_NAME) in a Triad protocol with $ARCH_NAME (architect).
-Context lives in .pair/ (requirements.md, plan.md, log.md — read them first).
+Read .pair/requirements.md and .pair/plan.md first; for .pair/log.md read only
+tail -$(log_tail_n) (never the whole file).
+$(budget_reminder)
 Implement the task below. Write code + run whatever verifies it. When done,
 summarize what changed and what you verified. If you add anything to the
 shared .pair/ files (plan.md amendments, notes), start the addition with the
@@ -376,8 +991,8 @@ attribution header '### $IMPL_NAME — <YYYY-MM-DD HH:MM:SS>'.
 
 Task from the architect ($ARCH_NAME):
 $TASK"
-  NEW_SID=$("${IMPL}_implement" "$OUT" "$SID" "$PROMPT") || die "implementer call failed (output kept at $OUT)"
-  if [ -n "$NEW_SID" ]; then session_set implementer "$IMPL" "$NEW_SID"; fi
+  role_dispatch implementer "$IMPL" implement implement "$OUT" "$PROMPT" >/dev/null \
+    || die "implementer call failed (output kept at $OUT)"
   RESULT=$(cat "$OUT")
   log "${PAIR_DRIVER:-$ARCH_NAME}" "Delegated task to $IMPL_NAME: $TASK"
   log "$IMPL_NAME" "$RESULT"
@@ -418,8 +1033,10 @@ given:    $TASK"
   OUT=$(mktemp)
   PROMPT="You are the JUNIOR IMPLEMENTER ($JR_NAME) in a three-agent Triad protocol
 ($ARCH_NAME = architect/reviewer, $IMPL_NAME = primary implementer, you = junior).
-Shared context lives in .pair/ (requirements.md, plan.md, log.md — read them
-first). You handle ONLY the single very basic task below. Hard limits:
+Read .pair/requirements.md and .pair/plan.md first; for .pair/log.md read only
+tail -$(log_tail_n) (never the whole file).
+$(budget_reminder)
+You handle ONLY the single very basic task below. Hard limits:
 - no architecture or design changes, no new dependencies, no refactors
 - no deleting or renaming files, nothing outside the task's scope
 - if the task turns out to be bigger than described, STOP and say so —
@@ -438,7 +1055,7 @@ $TASK"
   jq --arg ts "$(now)" '.junior_approval.consumed = true | .junior_approval.consumed_at = $ts' \
      "$STATE" > "$TMP" && mv "$TMP" "$STATE"
   echo "pair.sh: delegating to $JR_NAME..."
-  NEW_SID=$("${JR}_implement" "$OUT" "$SID" "$PROMPT") || die "junior call failed (output kept at $OUT)"
+  NEW_SID=$(dispatch_call junior "$JR" implement "$OUT" "$SID" "$PROMPT" implement) || die "junior call failed (output kept at $OUT)"
   if [ -n "$NEW_SID" ]; then session_set junior "$JR" "$NEW_SID"; fi
   RESULT=$(cat "$OUT")
   log "${PAIR_DRIVER:-$IMPL_NAME}" "Delegated approved task to $JR_NAME: $TASK"
@@ -448,12 +1065,49 @@ $TASK"
   echo "pair.sh: approval consumed — next junior task needs a fresh junior-approve. Run pair.sh review before accepting this work."
   ;;
 
+checkpoint)
+  need_state; migrate_state; resolve_roles
+  ROLE="${1:-}"
+  ROLES_TO_CP=""
+  if [ -n "$ROLE" ]; then
+    case "$ROLE" in
+      architect|implementer|junior) ROLES_TO_CP="$ROLE" ;;
+      *) die "unknown role '$ROLE' (want architect, implementer, or junior)" ;;
+    esac
+  else
+    # default: architect + implementer (the rollover-eligible roles), each only
+    # if it has a live session. Junior is exempt from automatic rollover and is
+    # checkpointed only when named explicitly.
+    for r in architect implementer; do
+      [ -n "$(jq -r ".sessions.$r.id // empty" "$STATE")" ] && ROLES_TO_CP="$ROLES_TO_CP $r"
+    done
+    [ -n "$ROLES_TO_CP" ] || die "no architect/implementer session to checkpoint — name a role: pair.sh checkpoint <role>"
+  fi
+  for r in $ROLES_TO_CP; do
+    echo "pair.sh: checkpointing $r..."
+    checkpoint_role "$r"
+  done
+  ;;
+
 status)
   need_state; migrate_state
   printf 'roles: architect=%s implementer=%s junior=%s human=%s\n' \
     "$(state_get roles.architect)" "$(state_get roles.implementer)" \
     "$(state_get roles.junior)" "$(state_get human)"
   jq . "$STATE"
+  jq -r '
+    ["architect", "implementer", "junior"][] as $r
+    | (.context[$r] // {}) as $c
+    | "context \($r): resident=\($c.resident_input_tokens // 0) window=\($c.context_window // 0) "
+      + (if (($c.context_window // 0) > 0) then
+           "pct=\((((($c.resident_input_tokens // 0) * 100) / $c.context_window) | floor))% "
+         else "pct=n/a " end)
+      + "raw=\($c.raw_total_tokens // 0) cached=\($c.cached_input_tokens // 0) "
+      + "tools=\($c.tool_calls // 0) calls=\($c.pair_calls // 0) "
+      + "source=\($c.source // "none") checkpoint=\($c.checkpoint_due // false) rollover=\($c.rollover_due // false) "
+      + "ckpts=\((.checkpoints[$r] // []) | length)"
+      + ((.checkpoints[$r] // []) | if length>0 then " last=#\(last.n)(\(last.reason),synth=\(last.synthesized // false))" else "" end)
+  ' "$STATE"
   echo "--- last log entries:"
   tail -20 "$PAIR/log.md"
   ;;

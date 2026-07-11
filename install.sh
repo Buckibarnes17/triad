@@ -105,6 +105,8 @@ cat <<EOF
    echo 'print("hello")' > hello.py
    bash $PAIR_SH review "T1"
    bash $PAIR_SH implement "Reply with exactly: pair-network-ok"
+   bash $PAIR_SH status                       # context counters + checkpoint history
+   bash $PAIR_SH checkpoint architect        # durable manual handoff, no rollover
 
    # junior gate (no model call — must refuse without a recorded approval):
    bash $PAIR_SH junior "anything"           # expect: refusal, exit 1

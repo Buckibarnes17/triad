@@ -4,6 +4,9 @@
 #   - _consult/_implement: reply text -> OUTFILE, stdout = session id ONLY
 #   - SESSION_ID empty = fresh session, non-empty = resume
 #   - adapter name (filename minus .sh) must match ^[a-z][a-z0-9_]*$
+#   - optional: after a successful call, write non-secret numeric telemetry to
+#     $PAIR_USAGE_FILE when it is non-empty. See docs/ADAPTERS.md; never expose
+#     that path to the assistant CLI or write prompt/reply text into it.
 # Env: PAIR_TEMPLATE_BIN — path to your CLI (example convention)
 
 template_display="Template"   # shown in prompts and ### <Agent> — <ts> headers
@@ -28,6 +31,13 @@ template_consult() { # OUTFILE SESSION_ID PROMPT -> stdout: session id only
   # extract reply text and (new) session id from your CLI's output format:
   jq -r '.reply // empty' "$raw" > "$out"
   new_sid=$(jq -r '.session // empty' "$raw")
+  # Optional example (adapt field names to your CLI; omit unsupported fields):
+  # if [ -n "${PAIR_USAGE_FILE:-}" ]; then
+  #   jq '{last_input_tokens:.usage.input_tokens,
+  #        call_total_tokens:.usage.total_tokens,
+  #        cached_input_tokens:(.usage.cached_input_tokens // 0)}' \
+  #      "$raw" > "$PAIR_USAGE_FILE" 2>/dev/null || :
+  # fi
   rm -f "$raw"
   printf '%s\n' "${new_sid:-$sid}"
 }
