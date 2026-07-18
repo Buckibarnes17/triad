@@ -18,6 +18,7 @@
 #   pair.sh junior-approve "<task>" "<note>"  record the human's one-time approval for a junior task
 #   pair.sh junior "<task>"            delegate an approved basic task to the junior
 #   pair.sh checkpoint [role]          write a context checkpoint (machine metadata + one agent summary)
+#   pair.sh driver-rollover            checkpoint + reset the DRIVER lane (the session running pair.sh)
 #   pair.sh status                     show state
 # Legacy aliases: claude -> implement, qwen -> junior, qwen-approve -> junior-approve.
 #
@@ -42,7 +43,11 @@
 # Context policy is captured at init from PAIR_CTX_MODE, PAIR_CTX_SOFT_TOKENS,
 # PAIR_CTX_ROLLOVER_TOKENS, PAIR_CTX_ROLLOVER_PCT, PAIR_CTX_CALL_LIMIT,
 # PAIR_CTX_RAW_WARN_TOKENS, PAIR_CTX_LOG_TAIL, PAIR_CTX_REVIEW_MAX_BYTES,
-# and PAIR_CTX_IMPLEMENT_FACTOR.
+# PAIR_CTX_IMPLEMENT_FACTOR, and PAIR_CTX_DRIVER_FACTOR.
+# The DRIVER lane meters the interactive session that runs pair.sh itself
+# (usually the orchestrating architect); PAIR_DRIVER_AGENT overrides which
+# adapter it is attributed to (default: architect for implement/review/status,
+# implementer for ask/suggest/junior).
 # Persisted state wins after init; these variables do not mutate live policy.
 # 'checkpoint' is manual-only for now: it records a context checkpoint (machine
 # metadata + one agent-authored summary) but never rolls a session over —
@@ -63,7 +68,12 @@ CTX_RAW_WARN_TOKENS_DEFAULT=2000000
 CTX_LOG_TAIL_DEFAULT=40
 CTX_REVIEW_MAX_BYTES_DEFAULT=200000
 CTX_IMPLEMENT_FACTOR_DEFAULT=4
+CTX_DRIVER_FACTOR_DEFAULT=8
 CTX_SYNTH_MAX_BYTES=20000
+# No shipping model window exceeds this; adapter telemetry claiming a larger
+# RESIDENT context is cumulative spend misreported as residency (observed with
+# qwen) and would otherwise cause permanent rollover thrash.
+CTX_MAX_PLAUSIBLE_RESIDENT=2000000
 
 die() { echo "pair.sh: $*" >&2; exit 1; }
 
@@ -139,6 +149,7 @@ validate_context_policy_env() {
   validate_uint PAIR_CTX_LOG_TAIL "${PAIR_CTX_LOG_TAIL:-$CTX_LOG_TAIL_DEFAULT}" 1 10000
   validate_uint PAIR_CTX_REVIEW_MAX_BYTES "${PAIR_CTX_REVIEW_MAX_BYTES:-$CTX_REVIEW_MAX_BYTES_DEFAULT}" 1024 100000000
   validate_uint PAIR_CTX_IMPLEMENT_FACTOR "${PAIR_CTX_IMPLEMENT_FACTOR:-$CTX_IMPLEMENT_FACTOR_DEFAULT}" 1 100
+  validate_uint PAIR_CTX_DRIVER_FACTOR "${PAIR_CTX_DRIVER_FACTOR:-$CTX_DRIVER_FACTOR_DEFAULT}" 1 100
 }
 
 ensure_context_schema() { # additive migration; existing values always win
@@ -152,11 +163,13 @@ ensure_context_schema() { # additive migration; existing values always win
     --argjson raw "$CTX_RAW_WARN_TOKENS_DEFAULT" \
     --argjson tail "$CTX_LOG_TAIL_DEFAULT" \
     --argjson review "$CTX_REVIEW_MAX_BYTES_DEFAULT" \
-    --argjson factor "$CTX_IMPLEMENT_FACTOR_DEFAULT" '
+    --argjson factor "$CTX_IMPLEMENT_FACTOR_DEFAULT" \
+    --argjson dfactor "$CTX_DRIVER_FACTOR_DEFAULT" '
       .context_policy = ({
         mode: $mode, soft_tokens: $soft, rollover_tokens: $rollover,
         rollover_pct: $pct, call_limit: $calls, raw_warn_tokens: $raw,
-        log_tail: $tail, review_max_bytes: $review, implement_factor: $factor
+        log_tail: $tail, review_max_bytes: $review, implement_factor: $factor,
+        driver_factor: $dfactor
       } + (.context_policy // {}))
       | .context = (.context // {})
       | .context.architect = ({resident_input_tokens: 0, context_window: 0,
@@ -171,7 +184,11 @@ ensure_context_schema() { # additive migration; existing values always win
           raw_total_tokens: 0, cached_input_tokens: 0, tool_calls: 0,
           pair_calls: 0, source: "none", checkpoint_due: false,
           rollover_due: false, soft_checkpoint_done: false, updated_at: null} + (.context.junior // {}))
-      | .checkpoints = ({architect: [], implementer: [], junior: []} + (.checkpoints // {}))
+      | .context.driver = ({agent: "", resident_input_tokens: 0, context_window: 0,
+          raw_total_tokens: 0, cached_input_tokens: 0, tool_calls: 0,
+          pair_calls: 0, source: "none", checkpoint_due: false,
+          rollover_due: false, soft_notified: false, updated_at: null} + (.context.driver // {}))
+      | .checkpoints = ({architect: [], implementer: [], junior: [], driver: []} + (.checkpoints // {}))
     ' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
 }
 
@@ -186,11 +203,12 @@ init_context_schema() { # init-time policy capture after validation
     --argjson raw "${PAIR_CTX_RAW_WARN_TOKENS:-$CTX_RAW_WARN_TOKENS_DEFAULT}" \
     --argjson tail "${PAIR_CTX_LOG_TAIL:-$CTX_LOG_TAIL_DEFAULT}" \
     --argjson review "${PAIR_CTX_REVIEW_MAX_BYTES:-$CTX_REVIEW_MAX_BYTES_DEFAULT}" \
-    --argjson factor "${PAIR_CTX_IMPLEMENT_FACTOR:-$CTX_IMPLEMENT_FACTOR_DEFAULT}" '
+    --argjson factor "${PAIR_CTX_IMPLEMENT_FACTOR:-$CTX_IMPLEMENT_FACTOR_DEFAULT}" \
+    --argjson dfactor "${PAIR_CTX_DRIVER_FACTOR:-$CTX_DRIVER_FACTOR_DEFAULT}" '
       .context_policy = {mode: $mode, soft_tokens: $soft,
         rollover_tokens: $rollover, rollover_pct: $pct, call_limit: $calls,
         raw_warn_tokens: $raw, log_tail: $tail, review_max_bytes: $review,
-        implement_factor: $factor}
+        implement_factor: $factor, driver_factor: $dfactor}
     ' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
   ensure_context_schema
 }
@@ -222,6 +240,17 @@ account_context_call() { # role lane prompt outfile usage-sidecar
     [ -n "$last_input" ] && source="usage"
   elif [ -s "$usage" ]; then
     echo "pair.sh: warning: adapter wrote invalid context telemetry; using estimate" >&2
+  fi
+  # Sanity clamp: a RESIDENT figure larger than the reported window (or any
+  # plausible window at all) is cumulative spend misreported as residency —
+  # trusting it would roll the session over on every call. Spend counters
+  # (call_total/cached) stay usage-derived; only residency falls back.
+  if [ "$source" = usage ]; then
+    if { [ -n "$window" ] && [ "$window" -gt 0 ] && [ "$last_input" -gt "$window" ]; } \
+       || [ "$last_input" -gt "$CTX_MAX_PLAUSIBLE_RESIDENT" ]; then
+      echo "pair.sh: warning: adapter reported implausible resident tokens ($last_input) — using estimate for context pressure" >&2
+      source="estimate"; last_input=""
+    fi
   fi
   [ -n "$call_total" ] || call_total="$estimate"
 
@@ -751,6 +780,220 @@ maybe_rollover() { # <role> — pre-dispatch check for ask/suggest/review/implem
   fi
 }
 
+# ── driver (orchestrator) context lane ───────────────────────────────────────
+# The session RUNNING pair.sh — an interactive orchestrator such as the
+# architect in an IDE chat — is invisible to the per-role machinery above: the
+# engine never launches it, so it can neither meter nor roll it, and observed
+# orchestrator sessions grew past their model window relying on the CLI's own
+# lossy last-ditch compaction. Every subcommand therefore accounts an estimate
+# (or real telemetry via the optional <agent>_driver_usage adapter hook) into
+# .context.driver and, past the same policy thresholds, prints an explicit
+# banner into the command OUTPUT — the one channel guaranteed to reach the
+# driver — telling it to run 'pair.sh driver-rollover' and continue in a fresh
+# session re-grounded from .pair/. The engine cannot switch the driver's
+# session, so auto and warn modes behave identically here; off disables it.
+
+driver_agent_for() { # <cmd> -> adapter name presumed to be driving this command
+  if [ -n "${PAIR_DRIVER_AGENT:-}" ]; then printf '%s' "$PAIR_DRIVER_AGENT"; return 0; fi
+  case "$1" in
+    ask|suggest|junior|junior-approve) printf '%s' "${IMPL:-}" ;;  # implementer-side entries
+    *)                                 printf '%s' "${ARCH:-}" ;;  # architect/orchestrator side
+  esac
+}
+
+account_driver_call() { # <cmd> <input_text> <output_bytes> — meter, then banner
+  local cmd="$1" input="$2" out_bytes="${3:-0}" mode dagent recorded t
+  mode=$(jq -r '.context_policy.mode // "auto"' "$STATE")
+  [ "$mode" = off ] && return 0
+  dagent=$(driver_agent_for "$cmd")
+  [[ "$dagent" =~ ^[a-z][a-z0-9_]*$ ]] || return 0   # nothing sane to attribute to
+  recorded=$(jq -r '.context.driver.agent // ""' "$STATE")
+  if [ -n "$recorded" ] && [ "$recorded" != "$dagent" ]; then
+    # a different driver took over — presume a fresh session; reset pressure only
+    t=$(mktemp)
+    jq --arg a "$dagent" '.context.driver += {agent: $a, resident_input_tokens: 0,
+        context_window: 0, tool_calls: 0, pair_calls: 0, checkpoint_due: false,
+        rollover_due: false, soft_notified: false, source: "none"}' \
+      "$STATE" > "$t" && mv "$t" "$STATE"
+  fi
+
+  local in_bytes factor estimate source last_input window cached usage
+  in_bytes=$(printf '%s' "$input" | wc -c)
+  factor=$(jq -r '.context_policy.driver_factor // 8' "$STATE")
+  estimate=$(( (in_bytes + out_bytes + 3) / 4 * factor ))
+  source="estimate"; last_input=""; window=""; cached=0
+  # optional real telemetry: the driver agent's adapter may know how to read
+  # its own CLI's local session records (see codex_driver_usage)
+  if ! declare -F "${dagent}_driver_usage" >/dev/null 2>&1 && [ -f "$ADAPTER_DIR/$dagent.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$ADAPTER_DIR/$dagent.sh" 2>/dev/null || true
+  fi
+  if declare -F "${dagent}_driver_usage" >/dev/null 2>&1; then
+    usage=$(mktemp)
+    if "${dagent}_driver_usage" "$usage" 2>/dev/null && [ -s "$usage" ] && jq -e '
+        type == "object"
+        and (.last_input_tokens? | type == "number" and . >= 0)
+        and ([.context_window?, .cached_input_tokens?]
+             | map(select(. != null)) | all(type == "number" and . >= 0))
+      ' "$usage" >/dev/null 2>&1; then
+      last_input=$(jq -r '.last_input_tokens | floor' "$usage")
+      window=$(jq -r '.context_window // 0 | floor' "$usage")
+      cached=$(jq -r '.cached_input_tokens // 0 | floor' "$usage")
+      source="usage"
+    fi
+    rm -f "$usage"
+  fi
+  if [ "$source" = usage ]; then      # same implausible-residency clamp as the role lanes
+    if { [ "${window:-0}" -gt 0 ] && [ "$last_input" -gt "$window" ]; } \
+       || [ "$last_input" -gt "$CTX_MAX_PLAUSIBLE_RESIDENT" ]; then
+      source="estimate"; last_input=""
+    fi
+  fi
+
+  local tmp ts; tmp=$(mktemp); ts=$(now)
+  jq --arg a "$dagent" --arg src "$source" --arg ts "$ts" \
+     --argjson est "$estimate" --argjson last "${last_input:-0}" \
+     --argjson win "${window:-0}" --argjson cached "$cached" '
+    (.context.driver // {}) as $old
+    | (.context_policy // {}) as $p
+    | (($old.resident_input_tokens // 0) + $est) as $estimated_resident
+    | (if $src == "usage" then $last else $estimated_resident end) as $resident
+    | (if $win > 0 then $win else ($old.context_window // 0) end) as $window
+    | (($old.raw_total_tokens // 0) + $est) as $raw_total
+    | (($old.cached_input_tokens // 0) + $cached) as $cached_total
+    | (($old.pair_calls // 0) + 1) as $pair_calls
+    | (($resident >= ($p.soft_tokens // 100000))
+       or ($raw_total >= ($p.raw_warn_tokens // 2000000))) as $checkpoint
+    | (($resident >= ($p.rollover_tokens // 150000))
+       or ($pair_calls >= ($p.call_limit // 20))
+       or ($window > 0 and (($resident * 100 / $window) >= ($p.rollover_pct // 70)))) as $rollover
+    | .context.driver = ($old + {agent: $a,
+        resident_input_tokens: $resident, context_window: $window,
+        raw_total_tokens: $raw_total, cached_input_tokens: $cached_total,
+        pair_calls: $pair_calls, source: $src,
+        checkpoint_due: $checkpoint, rollover_due: $rollover, updated_at: $ts})
+  ' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+
+  driver_banner
+}
+
+driver_banner() { # pressure guidance printed INTO the command output (stdout)
+  local roll soft notified resident window pct calls t
+  roll=$(jq -r '.context.driver.rollover_due // false' "$STATE")
+  soft=$(jq -r '.context.driver.checkpoint_due // false' "$STATE")
+  notified=$(jq -r '.context.driver.soft_notified // false' "$STATE")
+  resident=$(jq -r '.context.driver.resident_input_tokens // 0' "$STATE")
+  window=$(jq -r '.context.driver.context_window // 0' "$STATE")
+  calls=$(jq -r '.context.driver.pair_calls // 0' "$STATE")
+  pct="?"
+  if [ "$window" -gt 0 ]; then pct=$((resident * 100 / window)); fi
+  if [ "$roll" = true ]; then
+    cat <<EOF
+
+================== DRIVER CONTEXT ALERT (pair.sh) ==================
+The session RUNNING these pair.sh commands is at ~$resident resident
+tokens (window: $window, ${pct}%; pair calls this session: $calls) —
+past the rollover threshold. The engine cannot roll YOUR session over;
+do it yourself, now:
+  1. Run: pair.sh driver-rollover
+     (writes a .pair/checkpoints/driver/ handoff + resets these counters)
+  2. Append your own semantic handoff to the numbered checkpoint file it
+     prints, starting with an attribution header '### <You> — <timestamp>'.
+  3. END this session and continue in a FRESH one, re-grounding from
+     .pair/requirements.md, plan.md, the latest review, the driver
+     checkpoint, and tail -$(log_tail_n) .pair/log.md.
+Do not keep orchestrating in this session, and do not wait for your
+CLI's own auto-compaction — it fires after the window is already blown.
+====================================================================
+EOF
+  elif [ "$soft" = true ] && [ "$notified" != true ]; then
+    cat <<EOF
+
+pair.sh: DRIVER CONTEXT NOTE — the session running pair.sh is near the soft
+threshold (~$resident resident tokens, pair calls: $calls). Checkpoint soon
+('pair.sh checkpoint driver') and keep your session lean: delegate
+verification to the implementer, and never dump large files, diffs, or
+command output into your own context (bounded tails only).
+EOF
+    t=$(mktemp)
+    jq '.context.driver.soft_notified = true' "$STATE" > "$t" && mv "$t" "$STATE"
+  fi
+}
+
+checkpoint_driver() { # <reason> <reset(0|1)> — driver-lane handoff. The engine
+  # cannot query the driver's session, so the record is always synthesized;
+  # the numbered file is the durable handoff the driver itself should enrich.
+  # current.md is an ENGINE-OWNED mechanical snapshot (also event-refreshed
+  # after every review) — manual content belongs in the numbered file.
+  local reason="${1:-manual}" reset="${2:-0}" dagent name dir n n_int ts file digest head meta out tmp
+  dagent=$(jq -r '.context.driver.agent // ""' "$STATE")
+  name="$dagent"
+  if [ -z "$name" ]; then name="driver"; fi
+  if [[ "$dagent" =~ ^[a-z][a-z0-9_]*$ ]] && [ -f "$ADAPTER_DIR/$dagent.sh" ]; then
+    load_agent "$dagent"
+    name=$(display_of "$dagent")
+  fi
+  dir="$PAIR/checkpoints/driver"; mkdir -p "$dir"
+  n=$(next_seq "$dir"); n_int=$((10#$n)); ts=$(now); file="checkpoints/driver/$n.md"
+  digest=$(checkpoint_digest)
+  head=$(git rev-parse HEAD 2>/dev/null || echo "(no commits)")
+  meta="$(agent_header "$name")
+# CHECKPOINT driver #$n
+reason: $reason
+agent: ${dagent:-(unknown)}
+git_head: $head
+digest: $digest
+$(jq -r '(.context.driver // {}) |
+    "resident_input_tokens: \(.resident_input_tokens // 0)",
+    "context_window: \(.context_window // 0)",
+    "raw_total_tokens: \(.raw_total_tokens // 0)",
+    "pair_calls: \(.pair_calls // 0)"' "$STATE")"
+  out=$(mktemp)
+  checkpoint_synth_body driver "(driver checkpoint (reason=$reason): engine-synthesized — the driver session should append its own semantic handoff to THIS file, starting with '### $name — <timestamp>')" > "$out"
+  { printf '%s\nsemantic_valid: false\n' "$meta"
+    printf -- '--- SEMANTIC SUMMARY (valid=false) ---\n'
+    cat "$out"
+  } > "$PAIR/$file"
+  cp "$PAIR/$file" "$dir/current.md"
+  rm -f "$out"
+  log "$name" "Driver checkpoint #$n written ($file, reason=$reason). head=$head digest=${digest:0:12}"
+  tmp=$(mktemp)
+  jq --argjson n "$n_int" --arg at "$ts" --arg head "$head" --arg digest "$digest" \
+     --arg file "$file" --arg reason "$reason" '
+     .checkpoints.driver = ((.checkpoints.driver // []) + [{
+       n: $n, at: $at, reason: $reason, git_head: $head, digest: $digest,
+       semantic_valid: false, synthesized: true, file: $file,
+       counters: {
+         resident_input_tokens: (.context.driver.resident_input_tokens // 0),
+         raw_total_tokens: (.context.driver.raw_total_tokens // 0),
+         pair_calls: (.context.driver.pair_calls // 0)
+       }}])' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+  if [ "$reset" = 1 ]; then
+    tmp=$(mktemp)
+    jq '.context.driver += {resident_input_tokens: 0, context_window: 0,
+        tool_calls: 0, pair_calls: 0, checkpoint_due: false,
+        rollover_due: false, soft_notified: false, source: "none"}' \
+      "$STATE" > "$tmp" && mv "$tmp" "$STATE"
+  fi
+  echo "pair.sh: driver checkpoint #$n -> .pair/$file"
+}
+
+refresh_driver_current() { # <event> — cheap event-driven refresh of ONLY the
+  # engine-owned mechanical snapshot checkpoints/driver/current.md, so a driver
+  # that dies without a rollover still leaves a recent re-grounding point after
+  # every review. No numbered history, no state record, no agent call.
+  local event="$1" dir="$PAIR/checkpoints/driver" out
+  mkdir -p "$dir"
+  out=$(mktemp)
+  checkpoint_synth_body driver "(auto-refreshed driver re-grounding point after '$event' — engine-owned mechanical snapshot; durable handoffs live in the numbered checkpoint files)" > "$out"
+  { printf '### engine — %s\n' "$(now)"
+    printf '# DRIVER CURRENT (event-refreshed after %s; numbered history via pair.sh checkpoint driver)\n' "$event"
+    printf -- '--- SEMANTIC SUMMARY (valid=false) ---\n'
+    cat "$out"
+  } > "$dir/current.md"
+  rm -f "$out"
+}
+
 role_dispatch() { # <role> <agent> <verb> <lane> <outfile> <base_prompt>
   # Inject the handoff preamble on a fresh session, dispatch, and on a genuine
   # resume failure (rc==3) retry EXACTLY once with a fresh session — architect/
@@ -910,6 +1153,7 @@ $BRIEF"
   rm -f "$OUT"
   echo "pair.sh: intake done — read .pair/requirements.md and .pair/plan.md"
   echo "pair.sh: roles: architect=$ARCH implementer=$IMPL junior=${JR:-'(disabled)'}"
+  account_driver_call init "$BRIEF" "$(cat "$PAIR/requirements.md" "$PAIR/plan.md" 2>/dev/null | wc -c)"
   ;;
 
 ask|suggest)
@@ -939,7 +1183,9 @@ $MSG"
     log "$IMPL_NAME" "Q: $MSG"
     log "$ARCH_NAME" "$(cat "$OUT")"
   fi
-  cat "$OUT"; rm -f "$OUT"
+  cat "$OUT"
+  account_driver_call "$cmd" "$MSG" "$(wc -c < "$OUT")"
+  rm -f "$OUT"
   ;;
 
 review)
@@ -973,6 +1219,10 @@ $NOTES"
   log "$ARCH_NAME" "Review #$N written to reviews/$N.md (exit $RC)"
   echo "pair.sh: review saved -> $OUTFILE"
   tail -40 "$OUTFILE"
+  # every review is a natural handoff point: keep a fresh driver re-grounding
+  # snapshot on disk even if the orchestrating session later dies unrolled
+  refresh_driver_current "review #$N"
+  account_driver_call review "$NOTES" "$(wc -c < "$OUTFILE")"
   ;;
 
 implement)
@@ -994,9 +1244,11 @@ $TASK"
   role_dispatch implementer "$IMPL" implement implement "$OUT" "$PROMPT" >/dev/null \
     || die "implementer call failed (output kept at $OUT)"
   RESULT=$(cat "$OUT")
+  OUT_BYTES=$(wc -c < "$OUT")
   log "${PAIR_DRIVER:-$ARCH_NAME}" "Delegated task to $IMPL_NAME: $TASK"
   log "$IMPL_NAME" "$RESULT"
   echo "$RESULT"; rm -f "$OUT"
+  account_driver_call implement "$TASK" "$OUT_BYTES"
   ;;
 
 junior-approve)
@@ -1013,6 +1265,7 @@ junior-approve)
 Task: $TASK
 Note: $NOTE"
   echo "pair.sh: junior approval recorded (one run only) for: $TASK"
+  account_driver_call junior-approve "$TASK $NOTE" 0
   ;;
 
 junior)
@@ -1058,11 +1311,13 @@ $TASK"
   NEW_SID=$(dispatch_call junior "$JR" implement "$OUT" "$SID" "$PROMPT" implement) || die "junior call failed (output kept at $OUT)"
   if [ -n "$NEW_SID" ]; then session_set junior "$JR" "$NEW_SID"; fi
   RESULT=$(cat "$OUT")
+  OUT_BYTES=$(wc -c < "$OUT")
   log "${PAIR_DRIVER:-$IMPL_NAME}" "Delegated approved task to $JR_NAME: $TASK"
   log "$JR_NAME" "$RESULT"
   rm -f "$OUT"
   echo "$RESULT"
   echo "pair.sh: approval consumed — next junior task needs a fresh junior-approve. Run pair.sh review before accepting this work."
+  account_driver_call junior "$TASK" "$OUT_BYTES"
   ;;
 
 checkpoint)
@@ -1071,8 +1326,8 @@ checkpoint)
   ROLES_TO_CP=""
   if [ -n "$ROLE" ]; then
     case "$ROLE" in
-      architect|implementer|junior) ROLES_TO_CP="$ROLE" ;;
-      *) die "unknown role '$ROLE' (want architect, implementer, or junior)" ;;
+      architect|implementer|junior|driver) ROLES_TO_CP="$ROLE" ;;
+      *) die "unknown role '$ROLE' (want architect, implementer, junior, or driver)" ;;
     esac
   else
     # default: architect + implementer (the rollover-eligible roles), each only
@@ -1085,8 +1340,23 @@ checkpoint)
   fi
   for r in $ROLES_TO_CP; do
     echo "pair.sh: checkpointing $r..."
-    checkpoint_role "$r"
+    if [ "$r" = driver ]; then
+      checkpoint_driver manual 0
+    else
+      checkpoint_role "$r"
+    fi
   done
+  ;;
+
+driver-rollover)
+  # the driver-side twin of the engine's auto-rollover: durable checkpoint
+  # FIRST, then reset the driver pressure counters. The engine cannot switch
+  # the driver's session — the caller must end it and re-ground fresh.
+  need_state; migrate_state; resolve_roles
+  checkpoint_driver rollover-driver 1
+  echo "pair.sh: driver counters reset. Now END this session and continue in a"
+  echo "FRESH one, re-grounding from .pair/requirements.md, plan.md, the latest"
+  echo "review, the driver checkpoint above, and tail -$(log_tail_n) .pair/log.md."
   ;;
 
 status)
@@ -1096,7 +1366,7 @@ status)
     "$(state_get roles.junior)" "$(state_get human)"
   jq . "$STATE"
   jq -r '
-    ["architect", "implementer", "junior"][] as $r
+    ["architect", "implementer", "junior", "driver"][] as $r
     | (.context[$r] // {}) as $c
     | "context \($r): resident=\($c.resident_input_tokens // 0) window=\($c.context_window // 0) "
       + (if (($c.context_window // 0) > 0) then
@@ -1110,6 +1380,7 @@ status)
   ' "$STATE"
   echo "--- last log entries:"
   tail -20 "$PAIR/log.md"
+  account_driver_call status "" "$(wc -c < "$STATE")"
   ;;
 
 *)

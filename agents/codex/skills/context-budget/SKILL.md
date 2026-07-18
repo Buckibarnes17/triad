@@ -39,3 +39,14 @@ handoff and canonical files; on digest mismatch, trust current disk.
 
 The junior is exempt from automatic checkpoint calls, rollover, and retry.
 Its approval remains one approval = one attempted run.
+
+## The driver lane is YOU
+
+When you are the interactive session invoking pair.sh, the engine meters you
+as `.context.driver` (estimate, or your CLI's own local telemetry) but cannot
+roll you over. pair.sh output will carry a `DRIVER CONTEXT NOTE` near the
+soft threshold and a `DRIVER CONTEXT ALERT` past rollover. On ALERT: run
+`pair.sh driver-rollover`, append your semantic handoff to the numbered
+`.pair/checkpoints/driver/` file (attribution header first), end the session,
+and continue fresh from the canonical `.pair/` files. Do not keep working
+past an ALERT or wait for your CLI's auto-compaction.

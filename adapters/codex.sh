@@ -54,6 +54,42 @@ codex_consult() { # OUTFILE SESSION_ID PROMPT -> stdout: session id only
   printf '%s\n' "$sid"
 }
 
+codex_driver_usage() { # USAGE_OUT — best-effort resident-context telemetry for an
+  # INTERACTIVE Codex session driving pair.sh from this project directory (the
+  # engine's driver lane). Codex appends token_count events to its local rollout
+  # JSONL (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl) as a session runs; the
+  # freshest rollout whose recorded cwd matches this project is the driver —
+  # written moments ago by the very turn that invoked pair.sh. Bounded local
+  # read only: no network, no quota, no prompt content copied. Nonzero return =
+  # no fresh matching rollout; the engine falls back to its estimate.
+  local out="$1" dir="${CODEX_HOME:-$HOME/.codex}/sessions" f cwd_norm f_cwd now_s mtime
+  [ -d "$dir" ] || return 1
+  cwd_norm=$(pwd -W 2>/dev/null || pwd)              # Git Bash: Windows form, matching what codex records
+  cwd_norm=$(printf '%s' "$cwd_norm" | tr '\\' '/' | tr '[:upper:]' '[:lower:]')
+  now_s=$(date +%s)
+  while IFS= read -r f; do
+    mtime=$(date -r "$f" +%s 2>/dev/null || echo 0)
+    # ls -t order: once a file is stale, everything after it is staler — a
+    # stale rollout is an old session on disk, not the live driver
+    [ $((now_s - mtime)) -le 21600 ] || break
+    f_cwd=$(head -n1 "$f" | jq -r '.payload.cwd // empty' 2>/dev/null \
+              | tr '\\' '/' | tr '[:upper:]' '[:lower:]')
+    [ "$f_cwd" = "$cwd_norm" ] || continue
+    tail -n 400 "$f" | jq -s '
+      [.[] | select(.type == "event_msg" and .payload.type == "token_count"
+                    and ((.payload.info | type) == "object"))] | last
+      | if . == null then empty else
+          {last_input_tokens: (.payload.info.last_token_usage.input_tokens // 0),
+           cached_input_tokens: (.payload.info.last_token_usage.cached_input_tokens // 0)}
+          + (if (.payload.info.model_context_window // 0) > 0
+             then {context_window: .payload.info.model_context_window} else {} end)
+        end' > "$out" 2>/dev/null
+    [ -s "$out" ] && return 0
+    return 1
+  done < <(ls -t "$dir"/*/*/*/rollout-*.jsonl 2>/dev/null | head -15)
+  return 1
+}
+
 codex_review() { # OUTFILE SESSION_ID PROMPT — appends review text; returns CLI exit code
   local out="$1" prompt="$3" margs=() rc=0
   if [ -n "${PAIR_CODEX_MODEL:-}" ]; then margs=(-m "$PAIR_CODEX_MODEL"); fi

@@ -71,5 +71,18 @@ Gotchas:
   `git diff HEAD` embedded in the prompt (guarded for repos with no commits yet).
 - The junior approval gate (exact task match, consume-before-launch) is role
   logic in pair.sh, NOT in the qwen adapter — don't move it into an adapter.
+- The DRIVER lane (`.context.driver`) meters the interactive session running
+  pair.sh itself — a lane the engine can warn (banners printed into command
+  output; `pair.sh driver-rollover`) but never switch. Auto and warn modes
+  are identical for it. Real telemetry comes from the optional
+  `<agent>_driver_usage` hook (codex reads its own local rollout JSONL);
+  everything else is estimated at `driver_factor`× prompt+output size.
+- `checkpoints/driver/current.md` is ENGINE-OWNED (rewritten after every
+  review); manual/semantic driver handoffs belong in the numbered NNN.md
+  files — don't "fix" the refresh to preserve current.md.
+- Adapter-reported `last_input_tokens` is sanity-clamped: values above the
+  reported window (or above any plausible window) are cumulative spend
+  misreported as residency (observed with qwen) and fall back to the
+  estimator — don't trust raw adapter residency without the clamp.
 - Adapter files must be side-effect-free at source time; empty-array
   `"${arr[@]}"` expansion assumes bash ≥ 4.4; `readlink -f` assumes Linux.

@@ -1,9 +1,11 @@
-# qwen adapter — Qwen Code CLI (implementer/junior-capable).
+# qwen adapter — Qwen Code CLI (implementer/junior-capable; consult-capable
+# via a read-only lane, which also enables semantic checkpoints for qwen).
 # Sourced by pair.sh / install.sh; must be side-effect-free at source time.
 # Env: PAIR_QWEN_BIN      absolute path (default ~/.local/bin/qwen — qwen is
 #                         typically not on non-login-shell PATH)
 #      PAIR_QWEN_APPROVAL headless default mode denies edits/shell; the default
 #                         'yolo' mirrors Claude's acceptEdits + Bash grant
+#      PAIR_QWEN_CONSULT_APPROVAL  consult-lane mode (default 'default' = read-only)
 
 qwen_display="Qwen"
 
@@ -14,14 +16,14 @@ qwen_check() {
   [ -x "$bin" ] && echo "$bin (version $("$bin" --version 2>/dev/null || echo unknown))"
 }
 
-qwen_implement() { # OUTFILE SESSION_ID PROMPT -> stdout: session id only
-  local out="$1" sid="$2" prompt="$3" raw new_sid bin
+qwen__call() { # OUTFILE SESSION_ID PROMPT APPROVAL_MODE -> stdout: session id only
+  local out="$1" sid="$2" prompt="$3" approval="$4" raw new_sid bin
   bin=$(qwen__bin)
   [ -x "$bin" ] || { echo "qwen adapter: binary not found/executable at $bin — install it or set PAIR_QWEN_BIN" >&2; return 1; }
   raw=$(mktemp)
   local args=()
   if [ -n "$sid" ]; then args+=(-r "$sid"); fi
-  args+=(-p "$prompt" -o json --approval-mode "${PAIR_QWEN_APPROVAL:-yolo}")
+  args+=(-p "$prompt" -o json --approval-mode "$approval")
   "$bin" "${args[@]}" > "$raw" || { mv "$raw" "$out"; return 1; }
   # output is a JSON event array; the final type=="result" event carries the reply
   jq -r '[.[] | select(.type=="result")] | last | .result // empty' "$raw" > "$out"
@@ -50,6 +52,17 @@ qwen_implement() { # OUTFILE SESSION_ID PROMPT -> stdout: session id only
   fi
   rm -f "$raw"
   printf '%s\n' "${new_sid:-$sid}"
+}
+
+qwen_implement() { # write lane: headless default denies edits/shell, so 'yolo'
+  qwen__call "$1" "$2" "$3" "${PAIR_QWEN_APPROVAL:-yolo}"
+}
+
+qwen_consult() { # read-only lane: the headless 'default' approval mode denies
+  # edits and shell — exactly what consults and semantic checkpoints need.
+  # This is what lets the engine enrich qwen implementer checkpoints with a
+  # validated semantic summary instead of the mechanical/synthesized fallback.
+  qwen__call "$1" "$2" "$3" "${PAIR_QWEN_CONSULT_APPROVAL:-default}"
 }
 
 qwen_install() { # KIT_DIR PAIR_SH — uses install.sh helpers (ok/warn)

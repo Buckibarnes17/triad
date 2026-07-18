@@ -11,6 +11,28 @@ disposable cache; `.pair/` disk state is durable truth. Never read all of
 output near 100 lines/2K tokens, and re-ground from the current checkpoint
 after an engine rollover.
 
+## Your own context (the driver lane) — hard rules
+
+The engine meters the session YOU are running in (`.context.driver`) but it
+cannot roll you over — only you can. Observed failure mode: orchestrator
+sessions that ran verification themselves and dumped raw command output grew
+past the model window and lost their working set to lossy auto-compaction.
+
+- **Bounded output, numerically:** any command you run yourself must return
+  ≤ ~2K tokens (~100 lines). Redirect bigger output to a file and read a
+  bounded tail/slice. Never dump source files, full diffs, or raw test logs
+  into your own session.
+- **Delegate verification.** The implementer runs the code and reports
+  bounded results; you read reviews and summaries, not raw output.
+- **Act on the banners immediately.** A `DRIVER CONTEXT NOTE` in pair.sh
+  output means checkpoint soon (`bash __PAIR_SH__ checkpoint driver`). A
+  `DRIVER CONTEXT ALERT` means: run `bash __PAIR_SH__ driver-rollover`,
+  append your semantic handoff to the numbered
+  `.pair/checkpoints/driver/NNN.md` file it prints (attribution header
+  first), then END this session and continue in a fresh one re-grounded from
+  `.pair/`. Never keep orchestrating past an ALERT, and never rely on your
+  CLI's own auto-compaction — it fires after the window is already blown.
+
 ## Your role: ARCHITECT / ORCHESTRATOR / REVIEWER
 - Understand requirements, write the plan, find bugs, rule on suggestions.
 - **You do not write implementation code. The implementer writes all code.**

@@ -166,6 +166,7 @@ pair.sh implement "<task>"                drive the implementer headless (archit
 pair.sh junior-approve "<task>" "<note>"  record the human's one-time approval for a junior task
 pair.sh junior "<task>"                   delegate the approved basic task to the junior
 pair.sh checkpoint [role]                write a durable checkpoint without rolling over
+pair.sh driver-rollover                   checkpoint + reset the driver lane (see below), then start fresh
 pair.sh status                            roles + state + last log entries
 ```
 
@@ -182,6 +183,7 @@ reviews/NNN.md      # each review verdict (VERDICT: APPROVED / CHANGES_REQUIRED)
 suggestions/NNN.md  # implementer suggestions + architect rulings
 log.md              # append-only timeline of every exchange
 checkpoints/<role>/  # immutable NNN.md handoffs + current.md for fresh sessions
+                     # (roles + the driver lane — the session running pair.sh)
 ```
 
 `state.json` shape — roles are fixed at `pair.sh init` and live here (edit
@@ -296,6 +298,12 @@ afterward:
 | `PAIR_CTX_LOG_TAIL` | `40` | Routine `.pair/log.md` tail given to agents |
 | `PAIR_CTX_REVIEW_MAX_BYTES` | `200000` | Combined fallback-review bundle cap |
 | `PAIR_CTX_IMPLEMENT_FACTOR` | `4` | Conservative estimator multiplier for write lanes |
+| `PAIR_CTX_DRIVER_FACTOR` | `8` | Estimator multiplier for the driver (orchestrator) lane |
+
+The driver lane also honors `PAIR_DRIVER_AGENT` (any call, not just init): which
+adapter the session running pair.sh is attributed to. Default: the architect
+for `implement`/`review`/`status`/`init`, the implementer for
+`ask`/`suggest`/`junior`.
 
 Adapters may report numeric usage through a private temporary sidecar. This
 is optional: unsupported/invalid telemetry falls back to an engine estimate.
@@ -314,6 +322,36 @@ contain prompts, replies, credentials, keys, or environment values.
   architect/implementer. Arbitrary failures and every junior call get none.
 - `pair.sh checkpoint architect` or `implementer` creates a manual recovery
   point. `checkpoint junior` is mechanical-only and never invokes the junior.
+
+### The driver (orchestrator) lane
+
+The session *running* pair.sh — an interactive orchestrator such as the
+architect in an IDE chat — is one the engine never launches, so it can neither
+meter nor roll it directly. Real orchestrator sessions have been observed
+growing past their model window and losing context to the CLI's own last-ditch
+compaction, with no durable handoff. The engine therefore keeps a fourth
+context lane, `.context.driver`:
+
+- Every subcommand accounts the driver's estimated growth (prompt + printed
+  output, times `driver_factor`) and counts pair calls. An adapter may supply
+  real telemetry instead through an optional `<agent>_driver_usage` hook —
+  the shipped codex adapter reads the live session's resident tokens and
+  window from Codex's own local rollout file (bounded local read; no quota).
+- Past the same soft/rollover thresholds (including `call_limit` pair calls),
+  the engine prints an explicit banner **in the command output** — the one
+  channel guaranteed to reach the driver — telling it to run
+  `pair.sh driver-rollover`, append its own semantic handoff to the numbered
+  `.pair/checkpoints/driver/` file, END the session, and continue fresh from
+  the canonical `.pair/` files.
+- `pair.sh driver-rollover` writes the durable checkpoint first, then resets
+  the driver counters. `checkpoints/driver/current.md` is an engine-owned
+  mechanical snapshot, also auto-refreshed after every review so a driver
+  that dies unrolled still leaves a recent re-grounding point; manual
+  handoffs belong in the numbered files.
+- Since the engine cannot switch the driver's session, `auto` and `warn`
+  modes behave identically for this lane; `off` disables it. A driver-agent
+  change (e.g. a different assistant takes over orchestration) resets the
+  lane's pressure counters automatically.
 
 Adapter-specific (each adapter documents its own):
 

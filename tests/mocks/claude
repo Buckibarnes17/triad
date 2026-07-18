@@ -27,7 +27,13 @@ result="mock-claude-result $sid"
 if [ "${MOCK_CHECKPOINT_JSON:-0}" = 1 ] && [[ "$prompt" == *"CONTEXT"*"CHECKPOINT"* ]]; then
   result='{"goals":"preserve context","decisions":[{"decision":"use checkpoint","rationale":"bounded recovery"}],"blockers":"none","approvals_pending":"none","next_actions":["continue task"],"paths":["scripts/pair.sh"],"tests":"smoke passed"}'
 fi
-if [ "${MOCK_USAGE:-0}" = 1 ]; then
+if [ "${MOCK_USAGE_HUGE:-0}" = 1 ]; then
+  # cumulative spend masquerading as resident context — the engine must clamp
+  # this to its estimator instead of trusting it (rollover-thrash regression)
+  jq -n --arg sid "$sid" --arg result "$result" '{session_id: $sid, result: $result,
+    usage:{iterations:[{input_tokens:5000000, cache_creation_input_tokens:0,
+      cache_read_input_tokens:0, output_tokens:80}]}}'
+elif [ "${MOCK_USAGE:-0}" = 1 ]; then
   jq -n --arg sid "$sid" --arg result "$result" '{session_id: $sid, result: $result,
     usage:{iterations:[{input_tokens:100, cache_creation_input_tokens:20,
       cache_read_input_tokens:800, output_tokens:80}]}}'

@@ -311,5 +311,68 @@ grep -q '\[TRUNCATED\].*4096 bytes' "$MOCK_LOG" || fail "large review truncation
 [ "$(wc -c < .pair/log.md)" -ge "$LOG_BEFORE" ] || fail "log.md was truncated"
 pass "combined diff cap + explicit marker; durable log never truncated"
 
+echo "== 20. driver lane: metering, call-limit banner, driver-rollover, agent switch"
+M="$WORK/projM"; mkdir -p "$M"; cd "$M"
+PAIR_ARCHITECT=claude PAIR_JUNIOR= PAIR_CTX_CALL_LIMIT=3 bash "$PAIR_SH" init "brief M" >/dev/null
+jqe '.context_policy.call_limit == 3 and .context_policy.driver_factor == 8' .pair/state.json
+jqe '.context.driver.pair_calls == 1 and .context.driver.agent == "claude"
+     and .context.driver.source == "estimate"' .pair/state.json
+bash "$PAIR_SH" implement "task m1" > "$WORK/m1.out"
+grep -q 'DRIVER CONTEXT ALERT' "$WORK/m1.out" && fail "banner must not fire below thresholds"
+bash "$PAIR_SH" implement "task m2" > "$WORK/m2.out"      # 3rd driver call -> call_limit
+jqe '.context.driver.rollover_due == true' .pair/state.json
+grep -q 'DRIVER CONTEXT ALERT' "$WORK/m2.out" || fail "driver banner missing at call limit"
+grep -q 'driver-rollover' "$WORK/m2.out" || fail "banner must name the remedy"
+bash "$PAIR_SH" driver-rollover > "$WORK/dro.out"
+grep -q 'END this session' "$WORK/dro.out" || fail "driver-rollover fresh-session guidance missing"
+[ -s .pair/checkpoints/driver/001.md ] && [ -s .pair/checkpoints/driver/current.md ] \
+  || fail "driver checkpoint files missing"
+jqe '(.checkpoints.driver | length) == 1 and .checkpoints.driver[0].reason == "rollover-driver"
+     and .checkpoints.driver[0].synthesized == true
+     and .context.driver.pair_calls == 0 and .context.driver.rollover_due == false' .pair/state.json
+grep -q '^### Claude' .pair/checkpoints/driver/001.md || fail "driver checkpoint attribution"
+bash "$PAIR_SH" implement "task m3" > "$WORK/m3.out"
+grep -q 'DRIVER CONTEXT ALERT' "$WORK/m3.out" && fail "banner must clear after driver-rollover"
+echo "m" > m.txt
+bash "$PAIR_SH" review >/dev/null
+grep -q 'event-refreshed after review' .pair/checkpoints/driver/current.md \
+  || fail "review must refresh the driver current.md snapshot"
+PAIR_DRIVER_AGENT=qwen bash "$PAIR_SH" status >/dev/null
+jqe '.context.driver.agent == "qwen" and .context.driver.pair_calls == 1' .pair/state.json
+pass "driver metering, banner at call limit, rollover reset, review snapshot, agent-switch reset"
+
+echo "== 21. driver telemetry from a codex rollout + implausible-usage clamp"
+N="$WORK/projN"; mkdir -p "$N"; cd "$N"
+PAIR_ARCHITECT=claude PAIR_JUNIOR= bash "$PAIR_SH" init "brief N" >/dev/null
+CH="$WORK/codexhome"; mkdir -p "$CH/sessions/2026/07/18"
+TESTCWD=$(pwd -W 2>/dev/null || pwd)      # same normalization source the adapter uses
+ROLLOUT="$CH/sessions/2026/07/18/rollout-2026-07-18T00-00-00-test.jsonl"
+jq -cn --arg cwd "$TESTCWD" '{type:"session_meta", payload:{cwd:$cwd}}' > "$ROLLOUT"
+jq -cn '{type:"event_msg", payload:{type:"token_count",
+  info:{last_token_usage:{input_tokens:210000, cached_input_tokens:180000},
+        model_context_window:258400}}}' >> "$ROLLOUT"
+CODEX_HOME="$CH" PAIR_DRIVER_AGENT=codex bash "$PAIR_SH" status > "$WORK/n1.out"
+jqe '.context.driver.source == "usage" and .context.driver.resident_input_tokens == 210000
+     and .context.driver.context_window == 258400 and .context.driver.rollover_due == true' .pair/state.json
+grep -q 'DRIVER CONTEXT ALERT' "$WORK/n1.out" || fail "telemetry-driven driver banner missing"
+# role-lane clamp: adapter telemetry with cumulative-as-resident must fall back to the estimator
+MOCK_USAGE_HUGE=1 bash "$PAIR_SH" implement "task n-huge" >/dev/null 2>"$WORK/nclamp.err"
+grep -q 'implausible resident tokens' "$WORK/nclamp.err" || fail "implausible-telemetry warning missing"
+jqe '.context.implementer.source == "estimate"' .pair/state.json
+pass "codex rollout driver telemetry, telemetry banner, cumulative-as-resident clamp"
+
+echo "== 22. qwen read-only consult lane: architect capability + semantic checkpoint"
+Q="$WORK/projQ"; mkdir -p "$Q"; cd "$Q"
+PAIR_ARCHITECT=qwen PAIR_IMPLEMENTER=qwen PAIR_JUNIOR= bash "$PAIR_SH" init "brief Q" >/dev/null
+jqe '.sessions.architect.agent == "qwen"' .pair/state.json
+bash "$PAIR_SH" implement "task q" >/dev/null           # mint an implementer session
+: > "$MOCK_LOG"
+MOCK_CHECKPOINT_JSON=1 bash "$PAIR_SH" checkpoint implementer >/dev/null
+jqe '.checkpoints.implementer[-1].semantic_valid == true
+     and .checkpoints.implementer[-1].synthesized == false' .pair/state.json
+grep -q '^ARG:--approval-mode$' "$MOCK_LOG" || fail "qwen consult must pass approval-mode"
+grep -q '^ARG:default$' "$MOCK_LOG" || fail "qwen consult lane must be read-only (default approval mode)"
+pass "qwen consult lane: architect init + semantic (non-synthesized) checkpoint, read-only mode"
+
 echo
-echo "ALL SMOKE TESTS PASSED (19 scenarios)"
+echo "ALL SMOKE TESTS PASSED (22 scenarios)"

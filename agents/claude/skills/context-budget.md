@@ -36,3 +36,13 @@ Never put credentials, API keys, secrets, or environment values in a
 checkpoint. Never retry or roll over the junior lane; one approval remains one
 attempted run.
 
+## The driver lane is YOU
+
+When you are the interactive session invoking pair.sh, the engine meters you
+as `.context.driver` but cannot roll your session over. pair.sh output carries
+a `DRIVER CONTEXT NOTE` near the soft threshold and a `DRIVER CONTEXT ALERT`
+past rollover. On ALERT: run `pair.sh driver-rollover`, append your semantic
+handoff to the numbered `.pair/checkpoints/driver/` file (attribution header
+first), end the session, and continue fresh from the canonical `.pair/`
+files. Never keep orchestrating past an ALERT.
+

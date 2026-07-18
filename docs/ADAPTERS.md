@@ -118,6 +118,34 @@ Shipped telemetry coverage is deliberately best-effort: Claude parses
 write a sidecar only when their result events include recognized usage fields.
 Native review commands without structured usage fall back to estimation.
 
+The engine sanity-clamps `last_input_tokens`: a value above the reported
+`context_window` (or above any plausible model window) is treated as
+cumulative spend misreported as residency and the engine falls back to its
+estimate for context pressure. If your CLI only exposes cumulative usage,
+report it as `call_total_tokens` and omit `last_input_tokens`.
+
+### Optional driver-lane telemetry hook
+
+```
+<name>_driver_usage USAGE_OUT
+```
+
+The engine also meters the **driver** — the interactive session *running*
+pair.sh (usually the orchestrating architect), which the engine never
+launches and cannot query through the call sidecar. If the adapter for the
+presumed driver agent defines `<name>_driver_usage`, the engine calls it on
+every subcommand (cwd = the project root) instead of estimating. Write the
+same sidecar JSON object to `USAGE_OUT` (`last_input_tokens` required;
+`context_window` / `cached_input_tokens` optional) describing the *live
+interactive session for this project*, and return nonzero when you cannot
+tell (the engine then falls back to its estimate — never guess).
+
+Reference: `adapters/codex.sh` `codex_driver_usage` reads the freshest local
+Codex rollout JSONL whose recorded `cwd` matches the project and extracts the
+last `token_count` event — a bounded local file read; no network, no quota,
+no prompt content. The same rules apply here: numeric fields only, never
+prompts, secrets, or environment values.
+
 ### Source-time rules
 
 - **No side effects at source time.** The file is sourced by both pair.sh and
@@ -161,7 +189,9 @@ machine-level change behind `confirm`.
   lanes; resume mints a *new* session id each call (echoed back, engine
   persists it).
 - `adapters/qwen.sh` — JSON event-*array* output parsing; binary addressed by
-  absolute path because it's not on non-login-shell PATH.
+  absolute path because it's not on non-login-shell PATH; one CLI in two lanes
+  via `--approval-mode` (`default` = read-only consult — which also enables
+  semantic checkpoints when qwen implements — `yolo` = write).
 - `adapters/opencode.sh` — JSONL (one event per line — parse with plain `jq`
   filters, no array indexing) where the reply is split across *multiple*
   `type=="text"` events that must be concatenated in order (`jq -rj`);
